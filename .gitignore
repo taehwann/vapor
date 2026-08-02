@@ -1,0 +1,26 @@
+# CMake build outputs
+/build*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Compiled artifacts
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+
+# IDE and editor settings
+.vs/
+.vscode/
+*.sln
+*.vcxproj*
+
+# OS files
+.DS_Store
+Thumbs.db
