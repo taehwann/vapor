@@ -34,9 +34,7 @@ struct SmokeSim2D {
     float stirStrength = 0.6f;
     float sorOmega = 1.9f;
     float buoyancySplit = 0.5f;
-    float buoyancyExp = 0.25f;
     bool openLeft = true, openRight = true, openTop = true, openBottom = false;
-    static constexpr float decayFramesPerSec = 60.0f;
     std::vector<float> smoke, vx, vy, pressure, divergence;
 
     explicit SmokeSim2D(int res) {
@@ -231,6 +229,7 @@ struct SmokeSim2D {
     void emit(float strength, float dt) {
         if (strength <= 0.f) return;
         const float r2 = emitterRadius * emitterRadius, dx = h();
+        const float dtScale = dt * 60.0f;
         const int emitH = std::min(int(emitterCenterY * n + emitterRadius * n + 2), n);
         for (int y = std::max(0, int(emitterCenterY * n - emitterRadius * n - 1)); y < emitH; ++y)
             for (int x = 0; x < n; ++x) {
@@ -243,21 +242,18 @@ struct SmokeSim2D {
                 const int i = idC(x, y);
                 smoke[i] = std::max(smoke[i], std::min(1.0f, strength * emitterSmokeScale * w));
                 vy[idY(x, y)] = std::max(vy[idY(x, y)], (emitterKickBase + emitterKickScale * strength) * w);
-                vx[idX(x, y)] += (frand() - 0.5f) * stirStrength * w;
-                vx[idX(x + 1, y)] += (frand() - 0.5f) * stirStrength * w;
+                vx[idX(x, y)] += (frand() - 0.5f) * stirStrength * w * dtScale;
+                vx[idX(x + 1, y)] += (frand() - 0.5f) * stirStrength * w * dtScale;
             }
     }
 
-    void step(float dt, float buoyancy, float dissipation, float sourceStrength, int projectIterations) {
+    void step(float dt, float buoyancy, float sourceStrength, int projectIterations) {
         const float halfDt = 0.5f * dt;
         const int halfIters = std::max(1, projectIterations / 2);
-        const float halfDecay = std::pow(dissipation, halfDt * decayFramesPerSec);
         const float dxInv = 1.0f / h(), dx = h();
 
         // ---- Stage 1: forward half-step of smoke using u₀ ----
         advectScalar(smoke, halfDt);
-
-        for (int i = 0; i < n * n; ++i) smoke[i] *= halfDecay;
 
         for (int y = 0; y < n; ++y) {
             if (openLeft) {
@@ -294,7 +290,7 @@ struct SmokeSim2D {
 
         for (int y = 0; y < n; ++y)
             for (int x = 0; x < n; ++x) {
-                const float f = buoyancy * std::pow(smoke[idC(x, y)], buoyancyExp) * halfDt;
+                const float f = buoyancy * smoke[idC(x, y)] * halfDt;
                 vy[idY(x, y)] += buoyancySplit * f;
                 vy[idY(x, y + 1)] += buoyancySplit * f;
             }
@@ -311,8 +307,6 @@ struct SmokeSim2D {
 
         // ---- Stage 4: advect reflected fields using midpoint velocity, final project ----
         advectScalar(smoke, halfDt);
-
-        for (int i = 0; i < n * n; ++i) smoke[i] *= halfDecay;
 
         for (int y = 0; y < n; ++y) {
             if (openLeft) {
@@ -510,7 +504,7 @@ int main() {
     renderer.init();
 
     bool paused = false, showSpeed = false;
-    float buoyancy = 0.8f, dissipation = 0.995f, sourceStrength = 1.0f;
+    float buoyancy = 0.8f, sourceStrength = 1.0f;
     int projectIterations = 60;
     const float maxDt = 0.033f;
 
@@ -525,7 +519,7 @@ int main() {
         ImGui::Begin("Sim", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
         if (!paused)
-            sim.step(std::min(ImGui::GetIO().DeltaTime, maxDt), buoyancy, dissipation, sourceStrength, projectIterations);
+            sim.step(std::min(ImGui::GetIO().DeltaTime, maxDt), buoyancy, sourceStrength, projectIterations);
 
         ImVec2 avail = ImGui::GetContentRegionAvail();
         const float s = std::max(1.f, std::min(avail.x, avail.y));
@@ -568,8 +562,6 @@ int main() {
         }
         ImGui::Checkbox("Show velocity", &showSpeed);
         ImGui::SliderFloat("Buoyancy", &buoyancy, 0.0f, 10.0f);
-        ImGui::SliderFloat("Buoyancy exp", &sim.buoyancyExp, 0.1f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Dissipation", &dissipation, 0.970f, 1.000f, "%.3f");
         ImGui::SliderFloat("Source", &sourceStrength, 0.0f, 3.0f);
         ImGui::SliderInt("SOR iterations", &projectIterations, 10, 200);
         ImGui::SeparatorText("Boundaries");

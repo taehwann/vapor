@@ -21,6 +21,9 @@ compile_commands.json
 *.sln
 *.vcxproj*
 
+# ImGui
+imgui.ini
+
 # OS files
 .DS_Store
 Thumbs.db
