@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <numeric>
 #include <vector>
 
 #include "gl_loader.h"
@@ -51,6 +52,8 @@ struct SmokeSim2D {
     int idY(int x, int y) const { return x + n * y; }
     float h() const { return 1.0f / n; }
     bool inside(int x, int y) const { return x >= 0 && y >= 0 && x < n && y < n; }
+    bool insideVx(int x, int y) const { return x >= 0 && y >= 0 && x <= n && y < n; }
+    bool insideVy(int x, int y) const { return x >= 0 && y >= 0 && x < n && y <= n; }
     static float mix(float a, float b, float t) { return a + (b - a) * t; }
 
     float sampleCell(const std::vector<float>& f, Vec2 p) const {
@@ -93,11 +96,7 @@ struct SmokeSim2D {
     }
 
     float semiLagrangian(const std::vector<float>& source, Vec2 p, float dt) const {
-        Vec2 q = p - velocity(p) * dt;
-        const float pad = 0.5f * h();
-        q.x = std::clamp(q.x, pad, 1.0f - pad);
-        q.y = std::clamp(q.y, pad, 1.0f - pad);
-        return sampleCell(source, q);
+        return sampleCell(source, p - velocity(p) * dt);
     }
 
     void advectScalar(std::vector<float>& field, float dt) {
@@ -111,11 +110,7 @@ struct SmokeSim2D {
         for (int y = 0; y < n; ++y)
             for (int x = 0; x < n; ++x) {
                 Vec2 p{ (x + .5f) * dx, (y + .5f) * dx };
-                Vec2 q = p + velocity(p) * dt;
-                const float pad = 0.5f * h();
-                q.x = std::clamp(q.x, pad, 1.0f - pad);
-                q.y = std::clamp(q.y, pad, 1.0f - pad);
-                back[idC(x, y)] = sampleCell(fwd, q);
+                back[idC(x, y)] = sampleCell(fwd, p + velocity(p) * dt);
             }
 
         for (int y = 0; y < n; ++y)
@@ -136,31 +131,69 @@ struct SmokeSim2D {
     }
 
     void advectVx(float dt, const std::vector<float>& vxSrc, const std::vector<float>& vySrc) {
-        std::vector<float> result(vx.size());
+        std::vector<float> fwd(vx.size());
         const float dx = h();
         for (int y = 0; y < n; ++y)
             for (int x = 0; x <= n; ++x) {
                 const Vec2 face{ x * dx, (y + .5f) * dx };
-                Vec2 q = face - velocity(face, vxSrc, vySrc) * dt;
-                q.x = std::clamp(q.x, 0.f, 1.0f);
-                q.y = std::clamp(q.y, 0.5f * h(), 1.0f - 0.5f * h());
-                result[idX(x, y)] = sampleVxField(vxSrc, q);
+                fwd[idX(x, y)] = sampleVxField(vxSrc, face - velocity(face, vxSrc, vySrc) * dt);
             }
-        vx.swap(result);
+
+        std::vector<float> back(vx.size());
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x <= n; ++x) {
+                const Vec2 face{ x * dx, (y + .5f) * dx };
+                back[idX(x, y)] = sampleVxField(fwd, face + velocity(face, vxSrc, vySrc) * dt);
+            }
+
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x <= n; ++x) {
+                const int i = idX(x, y);
+                float corrected = fwd[i] + 0.5f * (vxSrc[i] - back[i]);
+                float fMin = vxSrc[i], fMax = vxSrc[i];
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx2 = -1; dx2 <= 1; ++dx2) {
+                        const int a = x + dx2, b = y + dy;
+                        if (insideVx(a, b)) {
+                            fMin = std::min(fMin, vxSrc[idX(a, b)]);
+                            fMax = std::max(fMax, vxSrc[idX(a, b)]);
+                        }
+                    }
+                vx[i] = std::clamp(corrected, fMin, fMax);
+            }
     }
 
     void advectVy(float dt, const std::vector<float>& vxSrc, const std::vector<float>& vySrc) {
-        std::vector<float> result(vy.size());
+        std::vector<float> fwd(vy.size());
         const float dx = h();
         for (int y = 0; y <= n; ++y)
             for (int x = 0; x < n; ++x) {
                 const Vec2 face{ (x + .5f) * dx, y * dx };
-                Vec2 q = face - velocity(face, vxSrc, vySrc) * dt;
-                q.x = std::clamp(q.x, 0.5f * h(), 1.0f - 0.5f * h());
-                q.y = std::clamp(q.y, 0.f, 1.0f);
-                result[idY(x, y)] = sampleVyField(vySrc, q);
+                fwd[idY(x, y)] = sampleVyField(vySrc, face - velocity(face, vxSrc, vySrc) * dt);
             }
-        vy.swap(result);
+
+        std::vector<float> back(vy.size());
+        for (int y = 0; y <= n; ++y)
+            for (int x = 0; x < n; ++x) {
+                const Vec2 face{ (x + .5f) * dx, y * dx };
+                back[idY(x, y)] = sampleVyField(fwd, face + velocity(face, vxSrc, vySrc) * dt);
+            }
+
+        for (int y = 0; y <= n; ++y)
+            for (int x = 0; x < n; ++x) {
+                const int i = idY(x, y);
+                float corrected = fwd[i] + 0.5f * (vySrc[i] - back[i]);
+                float fMin = vySrc[i], fMax = vySrc[i];
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx2 = -1; dx2 <= 1; ++dx2) {
+                        const int a = x + dx2, b = y + dy;
+                        if (insideVy(a, b)) {
+                            fMin = std::min(fMin, vySrc[idY(a, b)]);
+                            fMax = std::max(fMax, vySrc[idY(a, b)]);
+                        }
+                    }
+                vy[i] = std::clamp(corrected, fMin, fMax);
+            }
     }
 
     void applyBoundary() {
@@ -329,34 +362,178 @@ struct SmokeSim2D {
             }
         }
 
-        // Advect reflected vx using midpoint velocity
+        // Advect reflected vx using midpoint velocity (MacCormack)
         {
-            std::vector<float> result(vx.size());
+            std::vector<float> fwd(vx.size());
             for (int y = 0; y < n; ++y)
                 for (int x = 0; x <= n; ++x) {
-                    Vec2 face{ x * dx, (y + .5f) * dx };
-                    Vec2 q = face - velocity(face, vxMid, vyMid) * halfDt;
-                    q.x = std::clamp(q.x, 0.f, 1.f);
-                    q.y = std::clamp(q.y, 0.5f * dx, 1.f - 0.5f * dx);
-                    result[idX(x, y)] = sampleVxField(vxHat, q);
+                    const Vec2 face{ x * dx, (y + .5f) * dx };
+                    fwd[idX(x, y)] = sampleVxField(vxHat, face - velocity(face, vxMid, vyMid) * halfDt);
                 }
-            vx.swap(result);
+
+            std::vector<float> back(vx.size());
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x <= n; ++x) {
+                    const Vec2 face{ x * dx, (y + .5f) * dx };
+                    back[idX(x, y)] = sampleVxField(fwd, face + velocity(face, vxMid, vyMid) * halfDt);
+                }
+
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x <= n; ++x) {
+                    const int i = idX(x, y);
+                    float corrected = fwd[i] + 0.5f * (vxHat[i] - back[i]);
+                    float fMin = vxHat[i], fMax = vxHat[i];
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx2 = -1; dx2 <= 1; ++dx2) {
+                            const int a = x + dx2, b = y + dy;
+                            if (insideVx(a, b)) {
+                                fMin = std::min(fMin, vxHat[idX(a, b)]);
+                                fMax = std::max(fMax, vxHat[idX(a, b)]);
+                            }
+                        }
+                    vx[i] = std::clamp(corrected, fMin, fMax);
+                }
         }
-        // Advect reflected vy using midpoint velocity
+        // Advect reflected vy using midpoint velocity (MacCormack)
         {
-            std::vector<float> result(vy.size());
+            std::vector<float> fwd(vy.size());
             for (int y = 0; y <= n; ++y)
                 for (int x = 0; x < n; ++x) {
-                    Vec2 face{ (x + .5f) * dx, y * dx };
-                    Vec2 q = face - velocity(face, vxMid, vyMid) * halfDt;
-                    q.x = std::clamp(q.x, 0.5f * dx, 1.f - 0.5f * dx);
-                    q.y = std::clamp(q.y, 0.f, 1.f);
-                    result[idY(x, y)] = sampleVyField(vyHat, q);
+                    const Vec2 face{ (x + .5f) * dx, y * dx };
+                    fwd[idY(x, y)] = sampleVyField(vyHat, face - velocity(face, vxMid, vyMid) * halfDt);
                 }
-            vy.swap(result);
+
+            std::vector<float> back(vy.size());
+            for (int y = 0; y <= n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const Vec2 face{ (x + .5f) * dx, y * dx };
+                    back[idY(x, y)] = sampleVyField(fwd, face + velocity(face, vxMid, vyMid) * halfDt);
+                }
+
+            for (int y = 0; y <= n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const int i = idY(x, y);
+                    float corrected = fwd[i] + 0.5f * (vyHat[i] - back[i]);
+                    float fMin = vyHat[i], fMax = vyHat[i];
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx2 = -1; dx2 <= 1; ++dx2) {
+                            const int a = x + dx2, b = y + dy;
+                            if (insideVy(a, b)) {
+                                fMin = std::min(fMin, vyHat[idY(a, b)]);
+                                fMax = std::max(fMax, vyHat[idY(a, b)]);
+                            }
+                        }
+                    vy[i] = std::clamp(corrected, fMin, fMax);
+                }
         }
 
         project(halfDt, halfIters);
+    }
+
+    void stepNoReflect(float dt, float buoyancy, float sourceStrength, int projectIterations) {
+        const float dxInv = 1.0f / h(), dx = h();
+
+        // ---- Advect smoke full dt ----
+        advectScalar(smoke, dt);
+
+        for (int y = 0; y < n; ++y) {
+            if (openLeft) {
+                const float vf = -std::min(vx[idX(0, y)], 0.f);
+                smoke[idC(0, y)] = std::max(0.f, smoke[idC(0, y)] * (1.f - vf * dt * dxInv));
+            }
+            if (openRight) {
+                const float vf = std::max(vx[idX(n, y)], 0.f);
+                smoke[idC(n - 1, y)] = std::max(0.f, smoke[idC(n - 1, y)] * (1.f - vf * dt * dxInv));
+            }
+        }
+        for (int x = 0; x < n; ++x) {
+            if (openBottom) {
+                const float vf = -std::min(vy[idY(x, 0)], 0.f);
+                smoke[idC(x, 0)] = std::max(0.f, smoke[idC(x, 0)] * (1.f - vf * dt * dxInv));
+            }
+            if (openTop) {
+                const float vf = std::max(vy[idY(x, n)], 0.f);
+                smoke[idC(x, n - 1)] = std::max(0.f, smoke[idC(x, n - 1)] * (1.f - vf * dt * dxInv));
+            }
+        }
+
+        // ---- Advect velocity full dt (MacCormack self-advection) ----
+        {
+            std::vector<float> vxOld = vx, vyOld = vy;
+            advectVx(dt, vxOld, vyOld);
+            advectVy(dt, vxOld, vyOld);
+        }
+
+        // ---- Forces ----
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                const float f = buoyancy * smoke[idC(x, y)] * dt;
+                vy[idY(x, y)] += buoyancySplit * f;
+                vy[idY(x, y + 1)] += buoyancySplit * f;
+            }
+
+        emit(sourceStrength, dt);
+        project(dt, projectIterations);
+    }
+
+    void debugPrint(int frame) const {
+        std::printf("--- frame %d ---\n", frame);
+        std::printf("density  max=%+.4f  min=%+.4f  total=%+.4f\n",
+            *std::max_element(smoke.begin(), smoke.end()),
+            *std::min_element(smoke.begin(), smoke.end()),
+            std::accumulate(smoke.begin(), smoke.end(), 0.0f) / (n * n));
+
+        float divMax = 0.f;
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                float d = (vx[idX(x + 1, y)] - vx[idX(x, y)] +
+                           vy[idY(x, y + 1)] - vy[idY(x, y)]) / h();
+                if (std::fabs(d) > std::fabs(divMax)) divMax = d;
+            }
+        std::printf("div max=%+.6f\n", divMax);
+
+        float vMax = 0.f;
+        for (float v : vx) if (std::fabs(v) > vMax) vMax = std::fabs(v);
+        for (float v : vy) if (std::fabs(v) > vMax) vMax = std::fabs(v);
+        std::printf("vel max=%.4f\n", vMax);
+
+        int zeroInPlume = 0, holes = 0;
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                const int i = idC(x, y);
+                if (smoke[i] <= 0.f) {
+                    bool nearSmoke = false;
+                    for (int dy = -2; dy <= 2 && !nearSmoke; ++dy)
+                        for (int dx2 = -2; dx2 <= 2; ++dx2)
+                            if (inside(x + dx2, y + dy) && smoke[idC(x + dx2, y + dy)] > 0.01f)
+                                { nearSmoke = true; break; }
+                    if (nearSmoke) ++zeroInPlume;
+                }
+                if (smoke[i] <= 0.f) {
+                    int nc = 0;
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx2 = -1; dx2 <= 1; ++dx2)
+                            if ((dx2 || dy) && inside(x + dx2, y + dy) && smoke[idC(x + dx2, y + dy)] > 0.1f)
+                                ++nc;
+                    if (nc >= 5) ++holes;
+                }
+            }
+        std::printf("holes(surrounded)=%d  edges=%d\n\n", holes, zeroInPlume);
+
+        const int cw = 80, ch = 60;
+        const char map[] = " .-~=+*#@%";
+        const int yLo = 0, yHi = n - 1;
+        for (int cy = ch - 1; cy >= 0; --cy) {
+            int y = yLo + cy * (yHi - yLo) / (ch - 1);
+            for (int cx = 0; cx < cw; ++cx) {
+                int x = cx * (n - 1) / (cw - 1);
+                float d = smoke[idC(x, y)];
+                int idx = std::max(0, std::min(9, int(d * 10.f)));
+                std::putchar(map[idx]);
+            }
+            std::putchar('\n');
+        }
+        std::fflush(stdout);
     }
 };
 
@@ -503,9 +680,10 @@ int main() {
     FieldRenderer renderer;
     renderer.init();
 
-    bool paused = false, showSpeed = false;
+    bool paused = false, showSpeed = false, useReflection = false, debugPrintOn = false;
     float buoyancy = 0.8f, sourceStrength = 1.0f;
     int projectIterations = 60;
+    int debugFrame = 0;
     const float maxDt = 0.033f;
 
     while (!glfwWindowShouldClose(window)) {
@@ -518,8 +696,14 @@ int main() {
         ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
         ImGui::Begin("Sim", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-        if (!paused)
-            sim.step(std::min(ImGui::GetIO().DeltaTime, maxDt), buoyancy, sourceStrength, projectIterations);
+        if (!paused) {
+            if (useReflection)
+                sim.step(std::min(ImGui::GetIO().DeltaTime, maxDt), buoyancy, sourceStrength, projectIterations);
+            else
+                sim.stepNoReflect(std::min(ImGui::GetIO().DeltaTime, maxDt), buoyancy, sourceStrength, projectIterations);
+            if (debugPrintOn)
+                sim.debugPrint(++debugFrame);
+        }
 
         ImVec2 avail = ImGui::GetContentRegionAvail();
         const float s = std::max(1.f, std::min(avail.x, avail.y));
@@ -561,6 +745,8 @@ int main() {
             sim.openLeft = ol; sim.openRight = orr; sim.openTop = ot; sim.openBottom = ob;
         }
         ImGui::Checkbox("Show velocity", &showSpeed);
+        ImGui::Checkbox("Reflection", &useReflection);
+        ImGui::Checkbox("Debug print", &debugPrintOn);
         ImGui::SliderFloat("Buoyancy", &buoyancy, 0.0f, 10.0f);
         ImGui::SliderFloat("Source", &sourceStrength, 0.0f, 3.0f);
         ImGui::SliderInt("SOR iterations", &projectIterations, 10, 200);
