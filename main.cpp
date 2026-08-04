@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <numeric>
@@ -32,7 +33,8 @@ struct SmokeSim2D {
     float emitterKickBase = 0.6f;
     float emitterKickScale = 1.0f;
     float stirStrength = 0.6f;
-    float sorOmega = 1.9f;
+    float sorOmega = 1.95f;
+    float cflMc = 3.0f;
     float buoyancySplit = 0.5f;
     bool macCormackSmoke = true, macCormackVel = true;
     bool openLeft = true, openRight = true, openTop = true, openBottom = false;
@@ -118,23 +120,34 @@ struct SmokeSim2D {
         for (int y = 0; y < n; ++y)
             for (int x = 0; x < n; ++x) {
                 const int i = idC(x, y);
+                const Vec2 p{ (x + .5f) * dx, (y + .5f) * dx };
+                const Vec2 posFwd = p - velocity(p) * dt;
+                const Vec2 posBwd = p + velocity(p) * dt;
+                if (posFwd.x < 0.f || posFwd.x > 1.f || posFwd.y < 0.f || posFwd.y > 1.f ||
+                    posBwd.x < 0.f || posBwd.x > 1.f || posBwd.y < 0.f || posBwd.y > 1.f) {
+                    field[i] = fwd[i];
+                    continue;
+                }
                 float corrected = fwd[i] + 0.5f * (field[i] - back[i]);
-                float fMin = std::min(field[i], fwd[i]), fMax = std::max(field[i], fwd[i]);
+                float fMin = field[i], fMax = field[i];
                 for (int dy = -1; dy <= 1; ++dy)
                     for (int dx2 = -1; dx2 <= 1; ++dx2) {
                         const int a = x + dx2, b = y + dy;
                         if (inside(a, b)) {
-                            fMin = std::min({ fMin, fwd[idC(a, b)], field[idC(a, b)] });
-                            fMax = std::max({ fMax, fwd[idC(a, b)], field[idC(a, b)] });
+                            fMin = std::min(fMin, field[idC(a, b)]);
+                            fMax = std::max(fMax, field[idC(a, b)]);
                         }
                     }
-                field[i] = std::clamp(corrected, fMin, fMax);
+                if (corrected < fMin || corrected > fMax)
+                    field[i] = fwd[i];
+                else
+                    field[i] = corrected;
             }
     }
 
     void advectVx(float dt, const std::vector<float>& vxSrc,
                   const std::vector<float>& vxVel, const std::vector<float>& vyVel,
-                  std::vector<float>& out) {
+                  std::vector<float>& out, bool useMC = true) {
         std::vector<float> fwd(out.size());
         const float dx = h();
         for (int y = 0; y < n; ++y)
@@ -143,7 +156,7 @@ struct SmokeSim2D {
                 fwd[idX(x, y)] = sampleVxField(vxSrc, face - velocity(face, vxVel, vyVel) * dt);
             }
 
-        if (!macCormackVel) { out.swap(fwd); return; }
+        if (!useMC || !macCormackVel) { out.swap(fwd); return; }
 
         std::vector<float> back(out.size());
         for (int y = 0; y < n; ++y)
@@ -155,6 +168,16 @@ struct SmokeSim2D {
         for (int y = 0; y < n; ++y)
             for (int x = 0; x <= n; ++x) {
                 const int i = idX(x, y);
+                const Vec2 face{ x * dx, (y + .5f) * dx };
+                const Vec2 v = velocity(face, vxVel, vyVel);
+                const Vec2 posFwd = face - v * dt;
+                const Vec2 posBwd = face + v * dt;
+                if (posFwd.x < 0.f || posFwd.x > 1.f || posFwd.y < 0.f || posFwd.y > 1.f ||
+                    posBwd.x < 0.f || posBwd.x > 1.f || posBwd.y < 0.f || posBwd.y > 1.f ||
+                    std::sqrt(v.x * v.x + v.y * v.y) * dt / dx > cflMc) {
+                    out[i] = fwd[i];
+                    continue;
+                }
                 float corrected = fwd[i] + 0.5f * (vxSrc[i] - back[i]);
                 float fMin = vxSrc[i], fMax = vxSrc[i];
                 for (int dy = -1; dy <= 1; ++dy)
@@ -165,13 +188,16 @@ struct SmokeSim2D {
                             fMax = std::max(fMax, vxSrc[idX(a, b)]);
                         }
                     }
-                out[i] = std::clamp(corrected, fMin, fMax);
+                if (corrected < fMin || corrected > fMax)
+                    out[i] = fwd[i];
+                else
+                    out[i] = corrected;
             }
     }
 
     void advectVy(float dt, const std::vector<float>& vySrc,
                   const std::vector<float>& vxVel, const std::vector<float>& vyVel,
-                  std::vector<float>& out) {
+                  std::vector<float>& out, bool useMC = true) {
         std::vector<float> fwd(out.size());
         const float dx = h();
         for (int y = 0; y <= n; ++y)
@@ -180,7 +206,7 @@ struct SmokeSim2D {
                 fwd[idY(x, y)] = sampleVyField(vySrc, face - velocity(face, vxVel, vyVel) * dt);
             }
 
-        if (!macCormackVel) { out.swap(fwd); return; }
+        if (!useMC || !macCormackVel) { out.swap(fwd); return; }
 
         std::vector<float> back(out.size());
         for (int y = 0; y <= n; ++y)
@@ -192,6 +218,16 @@ struct SmokeSim2D {
         for (int y = 0; y <= n; ++y)
             for (int x = 0; x < n; ++x) {
                 const int i = idY(x, y);
+                const Vec2 face{ (x + .5f) * dx, y * dx };
+                const Vec2 v = velocity(face, vxVel, vyVel);
+                const Vec2 posFwd = face - v * dt;
+                const Vec2 posBwd = face + v * dt;
+                if (posFwd.x < 0.f || posFwd.x > 1.f || posFwd.y < 0.f || posFwd.y > 1.f ||
+                    posBwd.x < 0.f || posBwd.x > 1.f || posBwd.y < 0.f || posBwd.y > 1.f ||
+                    std::sqrt(v.x * v.x + v.y * v.y) * dt / dx > cflMc) {
+                    out[i] = fwd[i];
+                    continue;
+                }
                 float corrected = fwd[i] + 0.5f * (vySrc[i] - back[i]);
                 float fMin = vySrc[i], fMax = vySrc[i];
                 for (int dy = -1; dy <= 1; ++dy)
@@ -202,7 +238,10 @@ struct SmokeSim2D {
                             fMax = std::max(fMax, vySrc[idY(a, b)]);
                         }
                     }
-                out[i] = std::clamp(corrected, fMin, fMax);
+                if (corrected < fMin || corrected > fMax)
+                    out[i] = fwd[i];
+                else
+                    out[i] = corrected;
             }
     }
 
@@ -284,9 +323,12 @@ struct SmokeSim2D {
                 const float w = std::exp(-emitterFalloff * q);
                 const int i = idC(x, y);
                 smoke[i] = std::max(smoke[i], std::min(1.0f, strength * emitterSmokeScale * w));
-                vy[idY(x, y)] = std::max(vy[idY(x, y)], (emitterKickBase + emitterKickScale * strength) * w);
-                vx[idX(x, y)] += (frand() - 0.5f) * stirStrength * w * dtScale;
-                vx[idX(x + 1, y)] += (frand() - 0.5f) * stirStrength * w * dtScale;
+                const float kick = (emitterKickBase + emitterKickScale * strength) * w;
+                vy[idY(x, y)] = std::max(vy[idY(x, y)], kick);
+                vy[idY(x, y + 1)] = std::max(vy[idY(x, y + 1)], kick);
+                const float j = (frand() - 0.5f) * stirStrength * w * dtScale;
+                vx[idX(x, y)] += j;
+                vx[idX(x + 1, y)] += j;
             }
     }
 
@@ -372,8 +414,8 @@ struct SmokeSim2D {
             }
         }
 
-        advectVx(halfDt, vxHat, vxMid, vyMid, vx);
-        advectVy(halfDt, vyHat, vxMid, vyMid, vy);
+        advectVx(halfDt, vxHat, vxMid, vyMid, vx, macCormackVel);
+        advectVy(halfDt, vyHat, vxMid, vyMid, vy, macCormackVel);
 
         project(halfDt, halfIters);
     }
@@ -425,8 +467,19 @@ struct SmokeSim2D {
     }
 
     void debugPrint(int frame) const {
-        std::printf("--- frame %d ---\n", frame);
-        std::printf("density  max=%+.4f  min=%+.4f  total=%+.4f\n",
+        static FILE* logFile = nullptr;
+        if (!logFile) { fopen_s(&logFile, "vapor_debug.log", "w"); }
+        auto log = [&](const char* fmt, ...) {
+            va_list args;
+            va_start(args, fmt);
+            std::vprintf(fmt, args);
+            va_end(args);
+            va_start(args, fmt);
+            if (logFile) vfprintf(logFile, fmt, args);
+            va_end(args);
+        };
+        log("--- frame %d ---\n", frame);
+        log("density  max=%+.4f  min=%+.4f  total=%+.4f\n",
             *std::max_element(smoke.begin(), smoke.end()),
             *std::min_element(smoke.begin(), smoke.end()),
             std::accumulate(smoke.begin(), smoke.end(), 0.0f) / (n * n));
@@ -438,12 +491,12 @@ struct SmokeSim2D {
                            vy[idY(x, y + 1)] - vy[idY(x, y)]) / h();
                 if (std::fabs(d) > std::fabs(divMax)) divMax = d;
             }
-        std::printf("div max=%+.6f\n", divMax);
+        log("div max=%+.6f\n", divMax);
 
         float vMax = 0.f;
         for (float v : vx) if (std::fabs(v) > vMax) vMax = std::fabs(v);
         for (float v : vy) if (std::fabs(v) > vMax) vMax = std::fabs(v);
-        std::printf("vel max=%.4f\n", vMax);
+        log("vel max=%.4f\n", vMax);
 
         int zeroInPlume = 0, holes = 0;
         for (int y = 0; y < n; ++y)
@@ -466,7 +519,7 @@ struct SmokeSim2D {
                     if (nc >= 5) ++holes;
                 }
             }
-        std::printf("holes(surrounded)=%d  edges=%d\n\n", holes, zeroInPlume);
+        log("holes(surrounded)=%d  edges=%d\n\n", holes, zeroInPlume);
 
         const int cw = 80, ch = 60;
         const char map[] = " .-~=+*#@%";
@@ -478,10 +531,13 @@ struct SmokeSim2D {
                 float d = smoke[idC(x, y)];
                 int idx = std::max(0, std::min(9, int(d * 10.f)));
                 std::putchar(map[idx]);
+                if (logFile) fputc(map[idx], logFile);
             }
             std::putchar('\n');
+            if (logFile) fputc('\n', logFile);
         }
         std::fflush(stdout);
+        if (logFile) std::fflush(logFile);
     }
 };
 
@@ -630,7 +686,7 @@ int main() {
 
     bool paused = false, showSpeed = false, useReflection = false, debugPrintOn = false;
     float buoyancy = 0.8f, sourceStrength = 1.0f;
-    int projectIterations = 60;
+    int projectIterations = 400;
     int debugFrame = 0;
     const float maxDt = 0.033f;
 
@@ -645,10 +701,11 @@ int main() {
         ImGui::Begin("Sim", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
         if (!paused) {
+            float dt = std::min(ImGui::GetIO().DeltaTime, maxDt);
             if (useReflection)
-                sim.step(std::min(ImGui::GetIO().DeltaTime, maxDt), buoyancy, sourceStrength, projectIterations);
+                sim.step(dt, buoyancy, sourceStrength, projectIterations);
             else
-                sim.stepNoReflect(std::min(ImGui::GetIO().DeltaTime, maxDt), buoyancy, sourceStrength, projectIterations);
+                sim.stepNoReflect(dt, buoyancy, sourceStrength, projectIterations);
             if (debugPrintOn)
                 sim.debugPrint(++debugFrame);
         }
@@ -701,7 +758,8 @@ int main() {
         ImGui::Checkbox("Debug print", &debugPrintOn);
         ImGui::SliderFloat("Buoyancy", &buoyancy, 0.0f, 10.0f);
         ImGui::SliderFloat("Source", &sourceStrength, 0.0f, 3.0f);
-        ImGui::SliderInt("SOR iterations", &projectIterations, 10, 200);
+        ImGui::SliderInt("SOR iterations", &projectIterations, 10, 800);
+        ImGui::SliderFloat("MC CFL limit", &sim.cflMc, 0.5f, 10.0f);
         ImGui::SeparatorText("Boundaries");
         ImGui::Checkbox("Open left", &sim.openLeft);
         ImGui::SameLine();
