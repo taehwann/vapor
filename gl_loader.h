@@ -26,6 +26,7 @@ using GLsizeiptr = std::ptrdiff_t;
 #define GL_FRAGMENT_SHADER 0x8B30
 #define GL_COMPILE_STATUS 0x8B81
 #define GL_LINK_STATUS 0x8B82
+#define GL_FALSE 0
 #endif
 
 #define VAPOR_GL_FUNCTIONS(X) \
@@ -60,7 +61,8 @@ using GLsizeiptr = std::ptrdiff_t;
     X(void, glUniform1i, (GLint, GLint)) \
     X(void, glUniform1f, (GLint, GLfloat)) \
     X(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
-    X(void, glActiveTexture, (GLenum))
+    X(void, glActiveTexture, (GLenum)) \
+    X(void, glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*))
 
 #define VAPOR_DECLARE_GL_FUNCTION(return_type, name, arguments) \
     using name##Proc = return_type(APIENTRY*) arguments; \

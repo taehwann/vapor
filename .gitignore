@@ -24,6 +24,9 @@ compile_commands.json
 # ImGui
 imgui.ini
 
+# Debug logs
+*.log
+
 # OS files
 .DS_Store
 Thumbs.db

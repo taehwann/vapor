@@ -3,7 +3,6 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
-#include <numeric>
 #include <vector>
 
 #include "gl_loader.h"
@@ -12,10 +11,10 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
-struct Vec2 { float x, y; };
-static Vec2 operator-(Vec2 a, Vec2 b) { return { a.x - b.x, a.y - b.y }; }
-static Vec2 operator+(Vec2 a, Vec2 b) { return { a.x + b.x, a.y + b.y }; }
-static Vec2 operator*(Vec2 a, float s) { return { a.x * s, a.y * s }; }
+struct Vec3 { float x, y, z; };
+static Vec3 operator-(Vec3 a, Vec3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+static Vec3 operator+(Vec3 a, Vec3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+static Vec3 operator*(Vec3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
 
 static float frand() {
     static uint32_t state = 0x9E3779B9u;
@@ -23,648 +22,770 @@ static float frand() {
     return (state >> 8) * (1.0f / 16777216.0f);
 }
 
-struct SmokeSim2D {
-    int n = 256;
-    int displayMargin = 32;
-    float emitterRadius = 0.08f;
-    float emitterFalloff = 3.5f;
-    float emitterCenterX = 0.5f, emitterCenterY = 0.2f;
-    float emitterSmokeScale = 3.0f;
-    float emitterKickBase = 0.6f;
+struct SmokeSim3D {
+    int n = 64;
+    float boxSize = 3.0f;
+    float emitterRadius = 0.05f;
+    float emitterCenterX = 0.5f, emitterCenterY = 0.5f, emitterCenterZ = 0.15f;
+    float emitterKickBase = 1.2f;
     float emitterKickScale = 1.0f;
     float stirStrength = 0.6f;
     float sorOmega = 1.95f;
-    float cflMc = 3.0f;
     float buoyancySplit = 0.5f;
+    float cflMc = 3.0f;
     bool macCormackSmoke = true, macCormackVel = true;
-    bool openLeft = true, openRight = true, openTop = true, openBottom = false;
-    std::vector<float> smoke, vx, vy, pressure, divergence;
+    bool openXm = true, openXp = true, openYm = true, openYp = true, openZm = false, openZp = true;
+    std::vector<float> smoke, vx, vy, vz, pressure, divergence;
 
-    explicit SmokeSim2D(int res) {
+    explicit SmokeSim3D(int res) {
         n = res;
-        smoke.assign(n * n, 0);
-        vx.assign((n + 1) * n, 0);
-        vy.assign(n * (n + 1), 0);
-        pressure.assign(n * n, 0);
-        divergence.assign(n * n, 0);
+        smoke.assign(n * n * n, 0);
+        vx.assign((n + 1) * n * n, 0);
+        vy.assign(n * (n + 1) * n, 0);
+        vz.assign(n * n * (n + 1), 0);
+        pressure.assign(n * n * n, 0);
+        divergence.assign(n * n * n, 0);
     }
 
-    int idC(int x, int y) const { return x + n * y; }
-    int idX(int x, int y) const { return x + (n + 1) * y; }
-    int idY(int x, int y) const { return x + n * y; }
-    float h() const { return 1.0f / n; }
-    bool inside(int x, int y) const { return x >= 0 && y >= 0 && x < n && y < n; }
-    bool insideVx(int x, int y) const { return x >= 0 && y >= 0 && x <= n && y < n; }
-    bool insideVy(int x, int y) const { return x >= 0 && y >= 0 && x < n && y <= n; }
-    static float mix(float a, float b, float t) { return a + (b - a) * t; }
+    int idC(int x, int y, int z) const { return x + n * (y + n * z); }
+    int idX(int x, int y, int z) const { return x + (n + 1) * (y + n * z); }
+    int idY(int x, int y, int z) const { return x + n * (y + (n + 1) * z); }
+    int idZ(int x, int y, int z) const { return x + n * (y + n * z); }
+    float h() const { return boxSize / n; }
+    bool inside(int x, int y, int z) const { return x >= 0 && y >= 0 && z >= 0 && x < n && y < n && z < n; }
+    bool insideVx(int x, int y, int z) const { return x >= 0 && y >= 0 && z >= 0 && x <= n && y < n && z < n; }
+    bool insideVy(int x, int y, int z) const { return x >= 0 && y >= 0 && z >= 0 && x < n && y <= n && z < n; }
+    bool insideVz(int x, int y, int z) const { return x >= 0 && y >= 0 && z >= 0 && x < n && y < n && z <= n; }
 
-    float sampleCell(const std::vector<float>& f, Vec2 p) const {
+    float sampleCell(const std::vector<float>& f, Vec3 p) const {
         const float gx = std::clamp(p.x / h() - 0.5f, 0.f, float(n - 1));
         const float gy = std::clamp(p.y / h() - 0.5f, 0.f, float(n - 1));
-        const int x0 = int(gx), y0 = int(gy);
-        const int x1 = std::min(x0 + 1, n - 1), y1 = std::min(y0 + 1, n - 1);
-        const float tx = gx - x0, ty = gy - y0;
-        return mix(mix(f[idC(x0, y0)], f[idC(x1, y0)], tx),
-                   mix(f[idC(x0, y1)], f[idC(x1, y1)], tx), ty);
+        const float gz = std::clamp(p.z / h() - 0.5f, 0.f, float(n - 1));
+        const int x0 = int(gx), y0 = int(gy), z0 = int(gz);
+        const int x1 = std::min(x0 + 1, n - 1), y1 = std::min(y0 + 1, n - 1), z1 = std::min(z0 + 1, n - 1);
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idC(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idC(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idC(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idC(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idC(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idC(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idC(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idC(x1, y1, z1)] * tx * ty * tz;
     }
 
-    float sampleVxField(const std::vector<float>& f, Vec2 p) const {
+    float sampleVxField(const std::vector<float>& f, Vec3 p) const {
         const float gx = std::clamp(p.x / h(), 0.f, float(n));
         const float gy = std::clamp(p.y / h() - 0.5f, 0.f, float(n - 1));
-        const int x0 = std::min(int(gx), n - 1), y0 = int(gy);
-        const int x1 = x0 + 1, y1 = std::min(y0 + 1, n - 1);
-        const float tx = gx - x0, ty = gy - y0;
-        return mix(mix(f[idX(x0, y0)], f[idX(x1, y0)], tx),
-                   mix(f[idX(x0, y1)], f[idX(x1, y1)], tx), ty);
+        const float gz = std::clamp(p.z / h() - 0.5f, 0.f, float(n - 1));
+        const int x0 = std::min(int(gx), n - 1), y0 = int(gy), z0 = int(gz);
+        const int x1 = x0 + 1, y1 = std::min(y0 + 1, n - 1), z1 = std::min(z0 + 1, n - 1);
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idX(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idX(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idX(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idX(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idX(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idX(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idX(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idX(x1, y1, z1)] * tx * ty * tz;
     }
 
-    float sampleVx(Vec2 p) const { return sampleVxField(vx, p); }
-
-    float sampleVyField(const std::vector<float>& f, Vec2 p) const {
+    float sampleVyField(const std::vector<float>& f, Vec3 p) const {
         const float gx = std::clamp(p.x / h() - 0.5f, 0.f, float(n - 1));
         const float gy = std::clamp(p.y / h(), 0.f, float(n));
-        const int x0 = int(gx), y0 = std::min(int(gy), n - 1);
-        const int x1 = std::min(x0 + 1, n - 1), y1 = y0 + 1;
-        const float tx = gx - x0, ty = gy - y0;
-        return mix(mix(f[idY(x0, y0)], f[idY(x1, y0)], tx),
-                   mix(f[idY(x0, y1)], f[idY(x1, y1)], tx), ty);
+        const float gz = std::clamp(p.z / h() - 0.5f, 0.f, float(n - 1));
+        const int x0 = int(gx), y0 = std::min(int(gy), n - 1), z0 = int(gz);
+        const int x1 = std::min(x0 + 1, n - 1), y1 = y0 + 1, z1 = std::min(z0 + 1, n - 1);
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idY(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idY(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idY(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idY(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idY(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idY(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idY(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idY(x1, y1, z1)] * tx * ty * tz;
     }
 
-    float sampleVy(Vec2 p) const { return sampleVyField(vy, p); }
-
-    Vec2 velocity(Vec2 p) const { return { sampleVx(p), sampleVy(p) }; }
-    Vec2 velocity(Vec2 p, const std::vector<float>& vxSrc, const std::vector<float>& vySrc) const {
-        return { sampleVxField(vxSrc, p), sampleVyField(vySrc, p) };
+    float sampleVzField(const std::vector<float>& f, Vec3 p) const {
+        const float gx = std::clamp(p.x / h() - 0.5f, 0.f, float(n - 1));
+        const float gy = std::clamp(p.y / h() - 0.5f, 0.f, float(n - 1));
+        const float gz = std::clamp(p.z / h(), 0.f, float(n));
+        const int x0 = int(gx), y0 = int(gy), z0 = std::min(int(gz), n - 1);
+        const int x1 = std::min(x0 + 1, n - 1), y1 = std::min(y0 + 1, n - 1), z1 = z0 + 1;
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idZ(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idZ(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idZ(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idZ(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idZ(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idZ(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idZ(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idZ(x1, y1, z1)] * tx * ty * tz;
     }
 
-    float semiLagrangian(const std::vector<float>& source, Vec2 p, float dt) const {
-        return sampleCell(source, p - velocity(p) * dt);
+    float sampleVx(Vec3 p) const { return sampleVxField(vx, p); }
+    float sampleVy(Vec3 p) const { return sampleVyField(vy, p); }
+    float sampleVz(Vec3 p) const { return sampleVzField(vz, p); }
+    Vec3 velocity(Vec3 p) const { return { sampleVx(p), sampleVy(p), sampleVz(p) }; }
+    Vec3 velocity(Vec3 p, const std::vector<float>& vxSrc, const std::vector<float>& vySrc, const std::vector<float>& vzSrc) const {
+        return { sampleVxField(vxSrc, p), sampleVyField(vySrc, p), sampleVzField(vzSrc, p) };
+    }
+
+    float sampleCellDx(const std::vector<float>& f, Vec3 p, float dx) const {
+        const float gx = std::clamp(p.x / dx - 0.5f, 0.f, float(n - 1));
+        const float gy = std::clamp(p.y / dx - 0.5f, 0.f, float(n - 1));
+        const float gz = std::clamp(p.z / dx - 0.5f, 0.f, float(n - 1));
+        const int x0 = int(gx), y0 = int(gy), z0 = int(gz);
+        const int x1 = std::min(x0 + 1, n - 1), y1 = std::min(y0 + 1, n - 1), z1 = std::min(z0 + 1, n - 1);
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idC(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idC(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idC(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idC(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idC(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idC(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idC(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idC(x1, y1, z1)] * tx * ty * tz;
+    }
+
+    float sampleVxFieldDx(const std::vector<float>& f, Vec3 p, float dx) const {
+        const float gx = std::clamp(p.x / dx, 0.f, float(n));
+        const float gy = std::clamp(p.y / dx - 0.5f, 0.f, float(n - 1));
+        const float gz = std::clamp(p.z / dx - 0.5f, 0.f, float(n - 1));
+        const int x0 = std::min(int(gx), n - 1), y0 = int(gy), z0 = int(gz);
+        const int x1 = x0 + 1, y1 = std::min(y0 + 1, n - 1), z1 = std::min(z0 + 1, n - 1);
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idX(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idX(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idX(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idX(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idX(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idX(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idX(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idX(x1, y1, z1)] * tx * ty * tz;
+    }
+
+    float sampleVyFieldDx(const std::vector<float>& f, Vec3 p, float dx) const {
+        const float gx = std::clamp(p.x / dx - 0.5f, 0.f, float(n - 1));
+        const float gy = std::clamp(p.y / dx, 0.f, float(n));
+        const float gz = std::clamp(p.z / dx - 0.5f, 0.f, float(n - 1));
+        const int x0 = int(gx), y0 = std::min(int(gy), n - 1), z0 = int(gz);
+        const int x1 = std::min(x0 + 1, n - 1), y1 = y0 + 1, z1 = std::min(z0 + 1, n - 1);
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idY(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idY(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idY(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idY(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idY(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idY(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idY(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idY(x1, y1, z1)] * tx * ty * tz;
+    }
+
+    float sampleVzFieldDx(const std::vector<float>& f, Vec3 p, float dx) const {
+        const float gx = std::clamp(p.x / dx - 0.5f, 0.f, float(n - 1));
+        const float gy = std::clamp(p.y / dx - 0.5f, 0.f, float(n - 1));
+        const float gz = std::clamp(p.z / dx, 0.f, float(n));
+        const int x0 = int(gx), y0 = int(gy), z0 = std::min(int(gz), n - 1);
+        const int x1 = std::min(x0 + 1, n - 1), y1 = std::min(y0 + 1, n - 1), z1 = z0 + 1;
+        const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
+        return f[idZ(x0, y0, z0)] * (1 - tx) * (1 - ty) * (1 - tz) +
+            f[idZ(x1, y0, z0)] * tx * (1 - ty) * (1 - tz) +
+            f[idZ(x0, y1, z0)] * (1 - tx) * ty * (1 - tz) +
+            f[idZ(x1, y1, z0)] * tx * ty * (1 - tz) +
+            f[idZ(x0, y0, z1)] * (1 - tx) * (1 - ty) * tz +
+            f[idZ(x1, y0, z1)] * tx * (1 - ty) * tz +
+            f[idZ(x0, y1, z1)] * (1 - tx) * ty * tz +
+            f[idZ(x1, y1, z1)] * tx * ty * tz;
     }
 
     void advectScalar(std::vector<float>& field, float dt) {
-        std::vector<float> fwd(n * n);
         const float dx = h();
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x)
-                fwd[idC(x, y)] = semiLagrangian(field, { (x + .5f) * dx, (y + .5f) * dx }, dt);
+        const int N = n * n * n;
+        std::vector<float> fwd(N);
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x)
+                    fwd[idC(x, y, z)] = sampleCell(field, Vec3{ (x + .5f) * dx, (y + .5f) * dx, (z + .5f) * dx } - velocity(Vec3{ (x + .5f) * dx, (y + .5f) * dx, (z + .5f) * dx }) * dt);
 
         if (!macCormackSmoke) { field.swap(fwd); return; }
 
-        std::vector<float> back(n * n);
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x) {
-                Vec2 p{ (x + .5f) * dx, (y + .5f) * dx };
-                back[idC(x, y)] = sampleCell(fwd, p + velocity(p) * dt);
-            }
-
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x) {
-                const int i = idC(x, y);
-                const Vec2 p{ (x + .5f) * dx, (y + .5f) * dx };
-                const Vec2 posFwd = p - velocity(p) * dt;
-                const Vec2 posBwd = p + velocity(p) * dt;
-                if (posFwd.x < 0.f || posFwd.x > 1.f || posFwd.y < 0.f || posFwd.y > 1.f ||
-                    posBwd.x < 0.f || posBwd.x > 1.f || posBwd.y < 0.f || posBwd.y > 1.f) {
-                    field[i] = fwd[i];
-                    continue;
+        std::vector<float> back(N);
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    Vec3 p{ (x + .5f) * dx, (y + .5f) * dx, (z + .5f) * dx };
+                    back[idC(x, y, z)] = sampleCell(fwd, p + velocity(p) * dt);
                 }
-                float corrected = fwd[i] + 0.5f * (field[i] - back[i]);
-                float fMin = field[i], fMax = field[i];
-                for (int dy = -1; dy <= 1; ++dy)
-                    for (int dx2 = -1; dx2 <= 1; ++dx2) {
-                        const int a = x + dx2, b = y + dy;
-                        if (inside(a, b)) {
-                            fMin = std::min(fMin, field[idC(a, b)]);
-                            fMax = std::max(fMax, field[idC(a, b)]);
-                        }
+
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const int i = idC(x, y, z);
+                    Vec3 p{ (x + .5f) * dx, (y + .5f) * dx, (z + .5f) * dx };
+                    Vec3 posFwd = p - velocity(p) * dt;
+                    Vec3 posBwd = p + velocity(p) * dt;
+                    if (posFwd.x < 0 || posFwd.x > boxSize || posFwd.y < 0 || posFwd.y > boxSize || posFwd.z < 0 || posFwd.z > boxSize ||
+                        posBwd.x < 0 || posBwd.x > boxSize || posBwd.y < 0 || posBwd.y > boxSize || posBwd.z < 0 || posBwd.z > boxSize) {
+                        field[i] = fwd[i]; continue;
                     }
-                if (corrected < fMin || corrected > fMax)
-                    field[i] = fwd[i];
-                else
-                    field[i] = corrected;
-            }
+                    float corrected = fwd[i] + 0.5f * (field[i] - back[i]);
+                    int gx = std::clamp(int(posFwd.x / dx - 0.5f), 0, n - 1);
+                    int gy = std::clamp(int(posFwd.y / dx - 0.5f), 0, n - 1);
+                    int gz = std::clamp(int(posFwd.z / dx - 0.5f), 0, n - 1);
+                    float fMin = field[idC(gx, gy, gz)], fMax = fMin;
+                    for (int dz = 0; dz <= 1; ++dz)
+                        for (int dy = 0; dy <= 1; ++dy)
+                            for (int dx2 = 0; dx2 <= 1; ++dx2) {
+                                int a = std::clamp(gx + dx2, 0, n - 1);
+                                int b = std::clamp(gy + dy, 0, n - 1);
+                                int c = std::clamp(gz + dz, 0, n - 1);
+                                float val = field[idC(a, b, c)];
+                                fMin = std::min(fMin, val);
+                                fMax = std::max(fMax, val);
+                            }
+                    if (corrected < fMin || corrected > fMax) field[i] = fwd[i];
+                    else field[i] = corrected;
+                }
     }
 
     void advectVx(float dt, const std::vector<float>& vxSrc,
-                  const std::vector<float>& vxVel, const std::vector<float>& vyVel,
-                  std::vector<float>& out, bool useMC = true) {
-        std::vector<float> fwd(out.size());
+        const std::vector<float>& vxVel, const std::vector<float>& vyVel, const std::vector<float>& vzVel,
+        std::vector<float>& out, bool useMC = true) {
         const float dx = h();
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x <= n; ++x) {
-                const Vec2 face{ x * dx, (y + .5f) * dx };
-                fwd[idX(x, y)] = sampleVxField(vxSrc, face - velocity(face, vxVel, vyVel) * dt);
-            }
+        const int N = (int)out.size();
+        std::vector<float> fwd(N);
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x <= n; ++x) {
+                    Vec3 face{ x * dx, (y + .5f) * dx, (z + .5f) * dx };
+                    fwd[idX(x, y, z)] = sampleVxField(vxSrc, face - velocity(face, vxVel, vyVel, vzVel) * dt);
+                }
 
         if (!useMC || !macCormackVel) { out.swap(fwd); return; }
 
-        std::vector<float> back(out.size());
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x <= n; ++x) {
-                const Vec2 face{ x * dx, (y + .5f) * dx };
-                back[idX(x, y)] = sampleVxField(fwd, face + velocity(face, vxVel, vyVel) * dt);
-            }
-
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x <= n; ++x) {
-                const int i = idX(x, y);
-                const Vec2 face{ x * dx, (y + .5f) * dx };
-                const Vec2 v = velocity(face, vxVel, vyVel);
-                const Vec2 posFwd = face - v * dt;
-                const Vec2 posBwd = face + v * dt;
-                if (posFwd.x < 0.f || posFwd.x > 1.f || posFwd.y < 0.f || posFwd.y > 1.f ||
-                    posBwd.x < 0.f || posBwd.x > 1.f || posBwd.y < 0.f || posBwd.y > 1.f ||
-                    std::sqrt(v.x * v.x + v.y * v.y) * dt / dx > cflMc) {
-                    out[i] = fwd[i];
-                    continue;
+        std::vector<float> back(N);
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x <= n; ++x) {
+                    Vec3 face{ x * dx, (y + .5f) * dx, (z + .5f) * dx };
+                    back[idX(x, y, z)] = sampleVxField(fwd, face + velocity(face, vxVel, vyVel, vzVel) * dt);
                 }
-                float corrected = fwd[i] + 0.5f * (vxSrc[i] - back[i]);
-                float fMin = vxSrc[i], fMax = vxSrc[i];
-                for (int dy = -1; dy <= 1; ++dy)
-                    for (int dx2 = -1; dx2 <= 1; ++dx2) {
-                        const int a = x + dx2, b = y + dy;
-                        if (insideVx(a, b)) {
-                            fMin = std::min(fMin, vxSrc[idX(a, b)]);
-                            fMax = std::max(fMax, vxSrc[idX(a, b)]);
-                        }
+
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x <= n; ++x) {
+                    const int i = idX(x, y, z);
+                    Vec3 face{ x * dx, (y + .5f) * dx, (z + .5f) * dx };
+                    Vec3 v = velocity(face, vxVel, vyVel, vzVel);
+                    Vec3 posFwd = face - v * dt, posBwd = face + v * dt;
+                    float cfl = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z) * dt / dx;
+                    if (posFwd.x < 0 || posFwd.x > boxSize || posFwd.y < 0 || posFwd.y > boxSize || posFwd.z < 0 || posFwd.z > boxSize ||
+                        posBwd.x < 0 || posBwd.x > boxSize || posBwd.y < 0 || posBwd.y > boxSize || posBwd.z < 0 || posBwd.z > boxSize ||
+                        cfl > cflMc) {
+                        out[i] = fwd[i]; continue;
                     }
-                if (corrected < fMin || corrected > fMax)
-                    out[i] = fwd[i];
-                else
-                    out[i] = corrected;
-            }
+                    float corrected = fwd[i] + 0.5f * (vxSrc[i] - back[i]);
+                    int gx = std::clamp(int(posFwd.x / dx), 0, n);
+                    int gy = std::clamp(int(posFwd.y / dx - 0.5f), 0, n - 1);
+                    int gz = std::clamp(int(posFwd.z / dx - 0.5f), 0, n - 1);
+                    float fMin = vxSrc[idX(gx, gy, gz)], fMax = fMin;
+                    for (int dz = 0; dz <= 1; ++dz)
+                        for (int dy = 0; dy <= 1; ++dy)
+                            for (int dx2 = 0; dx2 <= 1; ++dx2) {
+                                int a = std::clamp(gx + dx2, 0, n);
+                                int b = std::clamp(gy + dy, 0, n - 1);
+                                int c = std::clamp(gz + dz, 0, n - 1);
+                                float val = vxSrc[idX(a, b, c)];
+                                fMin = std::min(fMin, val);
+                                fMax = std::max(fMax, val);
+                            }
+                    if (corrected < fMin || corrected > fMax) out[i] = fwd[i];
+                    else out[i] = corrected;
+                }
     }
 
     void advectVy(float dt, const std::vector<float>& vySrc,
-                  const std::vector<float>& vxVel, const std::vector<float>& vyVel,
-                  std::vector<float>& out, bool useMC = true) {
-        std::vector<float> fwd(out.size());
+        const std::vector<float>& vxVel, const std::vector<float>& vyVel, const std::vector<float>& vzVel,
+        std::vector<float>& out, bool useMC = true) {
         const float dx = h();
-        for (int y = 0; y <= n; ++y)
-            for (int x = 0; x < n; ++x) {
-                const Vec2 face{ (x + .5f) * dx, y * dx };
-                fwd[idY(x, y)] = sampleVyField(vySrc, face - velocity(face, vxVel, vyVel) * dt);
-            }
+        const int N = (int)out.size();
+        std::vector<float> fwd(N);
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y <= n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    Vec3 face{ (x + .5f) * dx, y * dx, (z + .5f) * dx };
+                    fwd[idY(x, y, z)] = sampleVyField(vySrc, face - velocity(face, vxVel, vyVel, vzVel) * dt);
+                }
 
         if (!useMC || !macCormackVel) { out.swap(fwd); return; }
 
-        std::vector<float> back(out.size());
-        for (int y = 0; y <= n; ++y)
-            for (int x = 0; x < n; ++x) {
-                const Vec2 face{ (x + .5f) * dx, y * dx };
-                back[idY(x, y)] = sampleVyField(fwd, face + velocity(face, vxVel, vyVel) * dt);
-            }
-
-        for (int y = 0; y <= n; ++y)
-            for (int x = 0; x < n; ++x) {
-                const int i = idY(x, y);
-                const Vec2 face{ (x + .5f) * dx, y * dx };
-                const Vec2 v = velocity(face, vxVel, vyVel);
-                const Vec2 posFwd = face - v * dt;
-                const Vec2 posBwd = face + v * dt;
-                if (posFwd.x < 0.f || posFwd.x > 1.f || posFwd.y < 0.f || posFwd.y > 1.f ||
-                    posBwd.x < 0.f || posBwd.x > 1.f || posBwd.y < 0.f || posBwd.y > 1.f ||
-                    std::sqrt(v.x * v.x + v.y * v.y) * dt / dx > cflMc) {
-                    out[i] = fwd[i];
-                    continue;
+        std::vector<float> back(N);
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y <= n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    Vec3 face{ (x + .5f) * dx, y * dx, (z + .5f) * dx };
+                    back[idY(x, y, z)] = sampleVyField(fwd, face + velocity(face, vxVel, vyVel, vzVel) * dt);
                 }
-                float corrected = fwd[i] + 0.5f * (vySrc[i] - back[i]);
-                float fMin = vySrc[i], fMax = vySrc[i];
-                for (int dy = -1; dy <= 1; ++dy)
-                    for (int dx2 = -1; dx2 <= 1; ++dx2) {
-                        const int a = x + dx2, b = y + dy;
-                        if (insideVy(a, b)) {
-                            fMin = std::min(fMin, vySrc[idY(a, b)]);
-                            fMax = std::max(fMax, vySrc[idY(a, b)]);
-                        }
+
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y <= n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const int i = idY(x, y, z);
+                    Vec3 face{ (x + .5f) * dx, y * dx, (z + .5f) * dx };
+                    Vec3 v = velocity(face, vxVel, vyVel, vzVel);
+                    Vec3 posFwd = face - v * dt, posBwd = face + v * dt;
+                    float cfl = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z) * dt / dx;
+                    if (posFwd.x < 0 || posFwd.x > boxSize || posFwd.y < 0 || posFwd.y > boxSize || posFwd.z < 0 || posFwd.z > boxSize ||
+                        posBwd.x < 0 || posBwd.x > boxSize || posBwd.y < 0 || posBwd.y > boxSize || posBwd.z < 0 || posBwd.z > boxSize ||
+                        cfl > cflMc) {
+                        out[i] = fwd[i]; continue;
                     }
-                if (corrected < fMin || corrected > fMax)
-                    out[i] = fwd[i];
-                else
-                    out[i] = corrected;
-            }
+                    float corrected = fwd[i] + 0.5f * (vySrc[i] - back[i]);
+                    int gx = std::clamp(int(posFwd.x / dx - 0.5f), 0, n - 1);
+                    int gy = std::clamp(int(posFwd.y / dx), 0, n);
+                    int gz = std::clamp(int(posFwd.z / dx - 0.5f), 0, n - 1);
+                    float fMin = vySrc[idY(gx, gy, gz)], fMax = fMin;
+                    for (int dz = 0; dz <= 1; ++dz)
+                        for (int dy = 0; dy <= 1; ++dy)
+                            for (int dx2 = 0; dx2 <= 1; ++dx2) {
+                                int a = std::clamp(gx + dx2, 0, n - 1);
+                                int b = std::clamp(gy + dy, 0, n);
+                                int c = std::clamp(gz + dz, 0, n - 1);
+                                float val = vySrc[idY(a, b, c)];
+                                fMin = std::min(fMin, val);
+                                fMax = std::max(fMax, val);
+                            }
+                    if (corrected < fMin || corrected > fMax) out[i] = fwd[i];
+                    else out[i] = corrected;
+                }
+    }
+
+    void advectVz(float dt, const std::vector<float>& vzSrc,
+        const std::vector<float>& vxVel, const std::vector<float>& vyVel, const std::vector<float>& vzVel,
+        std::vector<float>& out, bool useMC = true) {
+        const float dx = h();
+        const int N = (int)out.size();
+        std::vector<float> fwd(N);
+        for (int z = 0; z <= n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    Vec3 face{ (x + .5f) * dx, (y + .5f) * dx, z * dx };
+                    fwd[idZ(x, y, z)] = sampleVzField(vzSrc, face - velocity(face, vxVel, vyVel, vzVel) * dt);
+                }
+
+        if (!useMC || !macCormackVel) { out.swap(fwd); return; }
+
+        std::vector<float> back(N);
+        for (int z = 0; z <= n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    Vec3 face{ (x + .5f) * dx, (y + .5f) * dx, z * dx };
+                    back[idZ(x, y, z)] = sampleVzField(fwd, face + velocity(face, vxVel, vyVel, vzVel) * dt);
+                }
+
+        for (int z = 0; z <= n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const int i = idZ(x, y, z);
+                    Vec3 face{ (x + .5f) * dx, (y + .5f) * dx, z * dx };
+                    Vec3 v = velocity(face, vxVel, vyVel, vzVel);
+                    Vec3 posFwd = face - v * dt, posBwd = face + v * dt;
+                    float cfl = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z) * dt / dx;
+                    if (posFwd.x < 0 || posFwd.x > boxSize || posFwd.y < 0 || posFwd.y > boxSize || posFwd.z < 0 || posFwd.z > boxSize ||
+                        posBwd.x < 0 || posBwd.x > boxSize || posBwd.y < 0 || posBwd.y > boxSize || posBwd.z < 0 || posBwd.z > boxSize ||
+                        cfl > cflMc) {
+                        out[i] = fwd[i]; continue;
+                    }
+                    float corrected = fwd[i] + 0.5f * (vzSrc[i] - back[i]);
+                    int gx = std::clamp(int(posFwd.x / dx - 0.5f), 0, n - 1);
+                    int gy = std::clamp(int(posFwd.y / dx - 0.5f), 0, n - 1);
+                    int gz = std::clamp(int(posFwd.z / dx), 0, n);
+                    float fMin = vzSrc[idZ(gx, gy, gz)], fMax = fMin;
+                    for (int dz = 0; dz <= 1; ++dz)
+                        for (int dy = 0; dy <= 1; ++dy)
+                            for (int dx2 = 0; dx2 <= 1; ++dx2) {
+                                int a = std::clamp(gx + dx2, 0, n - 1);
+                                int b = std::clamp(gy + dy, 0, n - 1);
+                                int c = std::clamp(gz + dz, 0, n);
+                                float val = vzSrc[idZ(a, b, c)];
+                                fMin = std::min(fMin, val);
+                                fMax = std::max(fMax, val);
+                            }
+                    if (corrected < fMin || corrected > fMax) out[i] = fwd[i];
+                    else out[i] = corrected;
+                }
     }
 
     void applyBoundary() {
-        if (!openLeft)
-            for (int y = 0; y < n; ++y) vx[idX(0, y)] = 0.f;
-        if (!openRight)
-            for (int y = 0; y < n; ++y) vx[idX(n, y)] = 0.f;
-        if (!openBottom)
-            for (int x = 0; x < n; ++x) vy[idY(x, 0)] = 0.f;
-        if (!openTop)
-            for (int x = 0; x < n; ++x) vy[idY(x, n)] = 0.f;
+        if (!openXm) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(0, y, z)] = 0.f;
+        if (!openXp) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(n, y, z)] = 0.f;
+        if (!openYm) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, 0, z)] = 0.f;
+        if (!openYp) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, n, z)] = 0.f;
+        if (!openZm) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, 0)] = 0.f;
+        if (!openZp) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, n)] = 0.f;
     }
 
     void project(float dt, int iterations) {
         const float hInv = 1.0f / h(), h2 = h() * h();
-
         applyBoundary();
         std::fill(divergence.begin(), divergence.end(), 0.f);
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x)
-                divergence[idC(x, y)] = (vx[idX(x + 1, y)] - vx[idX(x, y)] +
-                                         vy[idY(x, y + 1)] - vy[idY(x, y)]) * hInv;
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x)
+                    divergence[idC(x, y, z)] = (vx[idX(x + 1, y, z)] - vx[idX(x, y, z)] +
+                        vy[idY(x, y + 1, z)] - vy[idY(x, y, z)] +
+                        vz[idZ(x, y, z + 1)] - vz[idZ(x, y, z)]) * hInv;
 
         std::fill(pressure.begin(), pressure.end(), 0.f);
-        const int dx[4] = { -1, 1, 0, 0 }, dy[4] = { 0, 0, -1, 1 };
+        const int dx[6] = { -1, 1, 0, 0, 0, 0 }, dy[6] = { 0, 0, -1, 1, 0, 0 }, dz[6] = { 0, 0, 0, 0, -1, 1 };
         const float omega = sorOmega;
 
         for (int iter = 0; iter < iterations; ++iter) {
             for (int parity = 0; parity < 2; ++parity) {
-                for (int y = 0; y < n; ++y)
-                    for (int x = 0; x < n; ++x) {
-                        if (((x + y) & 1) != parity) continue;
-                        const int i = idC(x, y);
-                        float sum = 0.f;
-                        int terms = 0;
-                        for (int k = 0; k < 4; ++k) {
-                            const int a = x + dx[k], b = y + dy[k];
-                            if (!inside(a, b)) continue;
-                            ++terms;
-                            sum += pressure[idC(a, b)];
+                for (int z = 0; z < n; ++z)
+                    for (int y = 0; y < n; ++y)
+                        for (int x = 0; x < n; ++x) {
+                            if (((x + y + z) & 1) != parity) continue;
+                            const int i = idC(x, y, z);
+                            float sum = 0.f;
+                            int terms = 0;
+                            for (int k = 0; k < 6; ++k) {
+                                int a = x + dx[k], b = y + dy[k], c = z + dz[k];
+                                if (!inside(a, b, c)) continue;
+                                ++terms;
+                                sum += pressure[idC(a, b, c)];
+                            }
+                            pressure[i] = (1.f - omega) * pressure[i] +
+                                omega * (sum - divergence[i] * h2 / dt) / std::max(terms, 1);
                         }
-                        pressure[i] = (1.f - omega) * pressure[i] +
-                                      omega * (sum - divergence[i] * h2 / dt) / std::max(terms, 1);
-                    }
             }
         }
 
-        for (int y = 0; y < n; ++y)
-            for (int x = 1; x < n; ++x)
-                vx[idX(x, y)] -= dt * (pressure[idC(x, y)] - pressure[idC(x - 1, y)]) * hInv;
-        for (int y = 1; y < n; ++y)
-            for (int x = 0; x < n; ++x)
-                vy[idY(x, y)] -= dt * (pressure[idC(x, y)] - pressure[idC(x, y - 1)]) * hInv;
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x <= n; ++x) {
+                    if ((x == 0 && !openXm) || (x == n && !openXp)) continue;
+                    float pRight = (x == n) ? 0.f : pressure[idC(x, y, z)];
+                    float pLeft = (x == 0) ? 0.f : pressure[idC(x - 1, y, z)];
+                    vx[idX(x, y, z)] -= dt * (pRight - pLeft) * hInv;
+                }
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y <= n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    if ((y == 0 && !openYm) || (y == n && !openYp)) continue;
+                    float pTop = (y == n) ? 0.f : pressure[idC(x, y, z)];
+                    float pBottom = (y == 0) ? 0.f : pressure[idC(x, y - 1, z)];
+                    vy[idY(x, y, z)] -= dt * (pTop - pBottom) * hInv;
+                }
+        for (int z = 0; z <= n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    if ((z == 0 && !openZm) || (z == n && !openZp)) continue;
+                    float pFront = (z == n) ? 0.f : pressure[idC(x, y, z)];
+                    float pBack = (z == 0) ? 0.f : pressure[idC(x, y, z - 1)];
+                    vz[idZ(x, y, z)] -= dt * (pFront - pBack) * hInv;
+                }
         applyBoundary();
 
-        if (openLeft)
-            for (int y = 0; y < n; ++y) vx[idX(0, y)] = std::min(vx[idX(0, y)], 0.f);
-        if (openRight)
-            for (int y = 0; y < n; ++y) vx[idX(n, y)] = std::max(vx[idX(n, y)], 0.f);
-        if (openBottom)
-            for (int x = 0; x < n; ++x) vy[idY(x, 0)] = std::min(vy[idY(x, 0)], 0.f);
-        if (openTop)
-            for (int x = 0; x < n; ++x) vy[idY(x, n)] = std::max(vy[idY(x, n)], 0.f);
+        if (openXm) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(0, y, z)] = std::min(vx[idX(0, y, z)], 0.f);
+        if (openXp) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(n, y, z)] = std::max(vx[idX(n, y, z)], 0.f);
+        if (openYm) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, 0, z)] = std::min(vy[idY(x, 0, z)], 0.f);
+        if (openYp) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, n, z)] = std::max(vy[idY(x, n, z)], 0.f);
+        if (openZm) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, 0)] = std::min(vz[idZ(x, y, 0)], 0.f);
+        if (openZp) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, n)] = std::max(vz[idZ(x, y, n)], 0.f);
     }
 
     void emit(float strength, float dt) {
         if (strength <= 0.f) return;
-        const float r2 = emitterRadius * emitterRadius, dx = h();
+        const float dx = h();
         const float dtScale = dt * 60.0f;
-        const int emitH = std::min(int(emitterCenterY * n + emitterRadius * n + 2), n);
-        for (int y = std::max(0, int(emitterCenterY * n - emitterRadius * n - 1)); y < emitH; ++y)
-            for (int x = 0; x < n; ++x) {
-                Vec2 p{ (x + .5f) * dx, (y + .5f) * dx };
-                const float dx2 = (p.x - emitterCenterX) * (p.x - emitterCenterX);
-                const float dy2 = (p.y - emitterCenterY) * (p.y - emitterCenterY);
-                const float q = (dx2 + dy2) / r2;
-                if (q > 1.0f) continue;
-                const float w = std::exp(-emitterFalloff * q);
-                const int i = idC(x, y);
-                smoke[i] = std::max(smoke[i], std::min(1.0f, strength * emitterSmokeScale * w));
-                const float kick = (emitterKickBase + emitterKickScale * strength) * w;
-                vy[idY(x, y)] = std::max(vy[idY(x, y)], kick);
-                vy[idY(x, y + 1)] = std::max(vy[idY(x, y + 1)], kick);
-                const float j = (frand() - 0.5f) * stirStrength * w * dtScale;
-                vx[idX(x, y)] += j;
-                vx[idX(x + 1, y)] += j;
-            }
+        const float ecx = emitterCenterX * boxSize, ecy = emitterCenterY * boxSize, ecz = emitterCenterZ * boxSize;
+        const float erad = emitterRadius * boxSize;
+        const int emitR = int(erad / dx + 1);
+        const int cx = int(ecx / dx), cy = int(ecy / dx), cz = int(ecz / dx);
+        for (int z = std::max(0, cz - emitR); z < std::min(n, cz + emitR); ++z)
+            for (int y = std::max(0, cy - emitR); y < std::min(n, cy + emitR); ++y)
+                for (int x = std::max(0, cx - emitR); x < std::min(n, cx + emitR); ++x) {
+                    Vec3 p{ (x + .5f) * dx, (y + .5f) * dx, (z + .5f) * dx };
+                    float qx = (p.x - ecx) / erad, qy = (p.y - ecy) / erad, qz = (p.z - ecz) / erad;
+                    float q = qx * qx + qy * qy + qz * qz;
+                    if (q > 1.0f) continue;
+                    const int i = idC(x, y, z);
+                    smoke[i] = 1.0f;
+                    const float kick = emitterKickBase + emitterKickScale * strength;
+                    vz[idZ(x, y, z)] = std::max(vz[idZ(x, y, z)], kick);
+                    vz[idZ(x, y, z + 1)] = std::max(vz[idZ(x, y, z + 1)], kick);
+                    const float j = (frand() - 0.5f) * stirStrength * dtScale;
+                    vx[idX(x, y, z)] += j; vx[idX(x + 1, y, z)] += j;
+                    vy[idY(x, y, z)] += j; vy[idY(x, y + 1, z)] += j;
+                }
+    }
+
+    void applyBuoyancy(float dtStep, float buoyancyVal) {
+        for (int z = 0; z < n; ++z)
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const float f = buoyancyVal * smoke[idC(x, y, z)] * dtStep;
+                    vz[idZ(x, y, z)] += buoyancySplit * f;
+                    vz[idZ(x, y, z + 1)] += buoyancySplit * f;
+                }
     }
 
     void step(float dt, float buoyancy, float sourceStrength, int projectIterations) {
         const float halfDt = 0.5f * dt;
         const int halfIters = std::max(1, projectIterations / 2);
-        const float dxInv = 1.0f / h();
 
-        // ---- Stage 1: forward half-step of smoke using u₀ ----
+        applyBuoyancy(halfDt, buoyancy);
+        emit(sourceStrength, halfDt);
         advectScalar(smoke, halfDt);
 
-        for (int y = 0; y < n; ++y) {
-            if (openLeft) {
-                const float vf = -std::min(vx[idX(0, y)], 0.f);
-                smoke[idC(0, y)] = std::max(0.f, smoke[idC(0, y)] * (1.f - vf * halfDt * dxInv));
-            }
-            if (openRight) {
-                const float vf = std::max(vx[idX(n, y)], 0.f);
-                smoke[idC(n - 1, y)] = std::max(0.f, smoke[idC(n - 1, y)] * (1.f - vf * halfDt * dxInv));
-            }
-        }
-        for (int x = 0; x < n; ++x) {
-            if (openBottom) {
-                const float vf = -std::min(vy[idY(x, 0)], 0.f);
-                smoke[idC(x, 0)] = std::max(0.f, smoke[idC(x, 0)] * (1.f - vf * halfDt * dxInv));
-            }
-            if (openTop) {
-                const float vf = std::max(vy[idY(x, n)], 0.f);
-                smoke[idC(x, n - 1)] = std::max(0.f, smoke[idC(x, n - 1)] * (1.f - vf * halfDt * dxInv));
-            }
-        }
-
-        // ---- Stage 2: forward advection of velocity, forces, project → u₁/₂ ----
-        std::vector<float> vx0 = vx, vy0 = vy;
-
-        std::vector<float> vxOld = vx, vyOld = vy; advectVx(halfDt, vxOld, vxOld, vyOld, vx);
+        std::vector<float> vx0 = vx, vy0 = vy, vz0 = vz;
+        std::vector<float> vxOld = vx, vyOld = vy, vzOld = vz;
+        advectVx(halfDt, vxOld, vxOld, vyOld, vzOld, vx);
         std::vector<float> vxTilde = vx;
-
-        vx = vx0; vy = vy0;
-        vxOld = vx; vyOld = vy; advectVy(halfDt, vyOld, vxOld, vyOld, vy);
+        vx = vx0; vy = vy0; vz = vz0;
+        vxOld = vx; vyOld = vy; vzOld = vz;
+        advectVy(halfDt, vyOld, vxOld, vyOld, vzOld, vy);
         std::vector<float> vyTilde = vy;
+        vx = vx0; vy = vy0; vz = vz0;
+        vxOld = vx; vyOld = vy; vzOld = vz;
+        advectVz(halfDt, vzOld, vxOld, vyOld, vzOld, vz);
+        std::vector<float> vzTilde = vz;
+        vx = vxTilde; vy = vyTilde;
 
-        vx = vxTilde;  // now vx,vy = ũ₁/₂ (forward-advected)
-
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x) {
-                const float f = buoyancy * smoke[idC(x, y)] * halfDt;
-                vy[idY(x, y)] += buoyancySplit * f;
-                vy[idY(x, y + 1)] += buoyancySplit * f;
-            }
-
-        emit(sourceStrength, dt);
         project(halfDt, halfIters);
 
-        std::vector<float> vxMid = vx, vyMid = vy;  // u₁/₂ (projected midpoint)
-
-        // ---- Stage 3: reflect  û = 2·u₁/₂ − ũ₁/₂ ----
-        std::vector<float> vxHat = vxMid, vyHat = vyMid;
+        std::vector<float> vxMid = vx, vyMid = vy, vzMid = vz;
+        std::vector<float> vxHat = vxMid, vyHat = vyMid, vzHat = vzMid;
         for (size_t i = 0; i < vx.size(); ++i) vxHat[i] = 2.f * vxMid[i] - vxTilde[i];
         for (size_t i = 0; i < vy.size(); ++i) vyHat[i] = 2.f * vyMid[i] - vyTilde[i];
+        for (size_t i = 0; i < vz.size(); ++i) vzHat[i] = 2.f * vzMid[i] - vzTilde[i];
 
-        // ---- Stage 4: advect reflected fields using midpoint velocity, final project ----
         advectScalar(smoke, halfDt);
+        advectVx(halfDt, vxHat, vxMid, vyMid, vzMid, vx, macCormackVel);
+        advectVy(halfDt, vyHat, vxMid, vyMid, vzMid, vy, macCormackVel);
+        advectVz(halfDt, vzHat, vxMid, vyMid, vzMid, vz, macCormackVel);
 
-        for (int y = 0; y < n; ++y) {
-            if (openLeft) {
-                const float vf = -std::min(vxMid[idX(0, y)], 0.f);
-                smoke[idC(0, y)] = std::max(0.f, smoke[idC(0, y)] * (1.f - vf * halfDt * dxInv));
-            }
-            if (openRight) {
-                const float vf = std::max(vxMid[idX(n, y)], 0.f);
-                smoke[idC(n - 1, y)] = std::max(0.f, smoke[idC(n - 1, y)] * (1.f - vf * halfDt * dxInv));
-            }
-        }
-        for (int x = 0; x < n; ++x) {
-            if (openBottom) {
-                const float vf = -std::min(vyMid[idY(x, 0)], 0.f);
-                smoke[idC(x, 0)] = std::max(0.f, smoke[idC(x, 0)] * (1.f - vf * halfDt * dxInv));
-            }
-            if (openTop) {
-                const float vf = std::max(vyMid[idY(x, n)], 0.f);
-                smoke[idC(x, n - 1)] = std::max(0.f, smoke[idC(x, n - 1)] * (1.f - vf * halfDt * dxInv));
-            }
-        }
-
-        advectVx(halfDt, vxHat, vxMid, vyMid, vx, macCormackVel);
-        advectVy(halfDt, vyHat, vxMid, vyMid, vy, macCormackVel);
-
+        applyBuoyancy(halfDt, buoyancy);
+        emit(sourceStrength, halfDt);
         project(halfDt, halfIters);
     }
 
     void stepNoReflect(float dt, float buoyancy, float sourceStrength, int projectIterations) {
-        const float dxInv = 1.0f / h();
-
-        // ---- Advect smoke full dt ----
         advectScalar(smoke, dt);
-
-        for (int y = 0; y < n; ++y) {
-            if (openLeft) {
-                const float vf = -std::min(vx[idX(0, y)], 0.f);
-                smoke[idC(0, y)] = std::max(0.f, smoke[idC(0, y)] * (1.f - vf * dt * dxInv));
-            }
-            if (openRight) {
-                const float vf = std::max(vx[idX(n, y)], 0.f);
-                smoke[idC(n - 1, y)] = std::max(0.f, smoke[idC(n - 1, y)] * (1.f - vf * dt * dxInv));
-            }
-        }
-        for (int x = 0; x < n; ++x) {
-            if (openBottom) {
-                const float vf = -std::min(vy[idY(x, 0)], 0.f);
-                smoke[idC(x, 0)] = std::max(0.f, smoke[idC(x, 0)] * (1.f - vf * dt * dxInv));
-            }
-            if (openTop) {
-                const float vf = std::max(vy[idY(x, n)], 0.f);
-                smoke[idC(x, n - 1)] = std::max(0.f, smoke[idC(x, n - 1)] * (1.f - vf * dt * dxInv));
-            }
-        }
-
-        // ---- Advect velocity full dt (MacCormack self-advection) ----
         {
-            std::vector<float> vxOld = vx, vyOld = vy;
-            advectVx(dt, vxOld, vxOld, vyOld, vx);
-            advectVy(dt, vyOld, vxOld, vyOld, vy);
+            std::vector<float> vxOld = vx, vyOld = vy, vzOld = vz;
+            advectVx(dt, vxOld, vxOld, vyOld, vzOld, vx);
+            advectVy(dt, vyOld, vxOld, vyOld, vzOld, vy);
+            advectVz(dt, vzOld, vxOld, vyOld, vzOld, vz);
         }
-
-        // ---- Forces ----
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x) {
-                const float f = buoyancy * smoke[idC(x, y)] * dt;
-                vy[idY(x, y)] += buoyancySplit * f;
-                vy[idY(x, y + 1)] += buoyancySplit * f;
-            }
-
+        applyBuoyancy(dt, buoyancy);
         emit(sourceStrength, dt);
         project(dt, projectIterations);
     }
 
-    void debugPrint(int frame) const {
-        static FILE* logFile = nullptr;
-        if (!logFile) { fopen_s(&logFile, "vapor_debug.log", "w"); }
-        auto log = [&](const char* fmt, ...) {
-            va_list args;
-            va_start(args, fmt);
-            std::vprintf(fmt, args);
-            va_end(args);
-            va_start(args, fmt);
-            if (logFile) vfprintf(logFile, fmt, args);
-            va_end(args);
-        };
-        log("--- frame %d ---\n", frame);
-        log("density  max=%+.4f  min=%+.4f  total=%+.4f\n",
-            *std::max_element(smoke.begin(), smoke.end()),
-            *std::min_element(smoke.begin(), smoke.end()),
-            std::accumulate(smoke.begin(), smoke.end(), 0.0f) / (n * n));
-
-        float divMax = 0.f;
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x) {
-                float d = (vx[idX(x + 1, y)] - vx[idX(x, y)] +
-                           vy[idY(x, y + 1)] - vy[idY(x, y)]) / h();
-                if (std::fabs(d) > std::fabs(divMax)) divMax = d;
-            }
-        log("div max=%+.6f\n", divMax);
-
-        float vMax = 0.f;
-        for (float v : vx) if (std::fabs(v) > vMax) vMax = std::fabs(v);
-        for (float v : vy) if (std::fabs(v) > vMax) vMax = std::fabs(v);
-        log("vel max=%.4f\n", vMax);
-
-        int zeroInPlume = 0, holes = 0;
-        for (int y = 0; y < n; ++y)
-            for (int x = 0; x < n; ++x) {
-                const int i = idC(x, y);
-                if (smoke[i] <= 0.f) {
-                    bool nearSmoke = false;
-                    for (int dy = -2; dy <= 2 && !nearSmoke; ++dy)
-                        for (int dx2 = -2; dx2 <= 2; ++dx2)
-                            if (inside(x + dx2, y + dy) && smoke[idC(x + dx2, y + dy)] > 0.01f)
-                                { nearSmoke = true; break; }
-                    if (nearSmoke) ++zeroInPlume;
-                }
-                if (smoke[i] <= 0.f) {
-                    int nc = 0;
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dx2 = -1; dx2 <= 1; ++dx2)
-                            if ((dx2 || dy) && inside(x + dx2, y + dy) && smoke[idC(x + dx2, y + dy)] > 0.1f)
-                                ++nc;
-                    if (nc >= 5) ++holes;
-                }
-            }
-        log("holes(surrounded)=%d  edges=%d\n\n", holes, zeroInPlume);
-
-        const int cw = 80, ch = 60;
-        const char map[] = " .-~=+*#@%";
-        const int yLo = 0, yHi = n - 1;
-        for (int cy = ch - 1; cy >= 0; --cy) {
-            int y = yLo + cy * (yHi - yLo) / (ch - 1);
-            for (int cx = 0; cx < cw; ++cx) {
-                int x = cx * (n - 1) / (cw - 1);
-                float d = smoke[idC(x, y)];
-                int idx = std::max(0, std::min(9, int(d * 10.f)));
-                std::putchar(map[idx]);
-                if (logFile) fputc(map[idx], logFile);
-            }
-            std::putchar('\n');
-            if (logFile) fputc('\n', logFile);
-        }
-        std::fflush(stdout);
-        if (logFile) std::fflush(logFile);
+    void rebox(float oldSz, float newSz) {
+        if (newSz == oldSz) return;
+        boxSize = newSz;
+        std::fill(smoke.begin(), smoke.end(), 0.f);
+        std::fill(vx.begin(), vx.end(), 0.f);
+        std::fill(vy.begin(), vy.end(), 0.f);
+        std::fill(vz.begin(), vz.end(), 0.f);
+        std::fill(pressure.begin(), pressure.end(), 0.f);
+        std::fill(divergence.begin(), divergence.end(), 0.f);
     }
 };
 
-struct FieldRenderer {
-    GLuint prog = 0, vao = 0, vbo = 0, fieldTex = 0, fbo = 0, renderTex = 0;
-    int texWidth = 0, texHeight = 0;
+struct VolumeRenderer {
+    GLuint prog = 0, vao = 0, vbo = 0, volumeTex = 0;
+    int n = 0;
 
-    void init() {
-        const float quadv[] = { -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, -1.f, 1.f, 1.f, -1.f, 1.f, 1.f };
+    void init(int res, float boxSz) {
+        n = res;
+        const float s = boxSz;
+        float cube[] = {
+            // -Z face
+            0,0,0,  0,s,0,  s,s,0,  0,0,0,  s,s,0,  s,0,0,
+            // +Z face
+            0,0,s,  s,0,s,  s,s,s,  0,0,s,  s,s,s,  0,s,s,
+            // -Y face
+            0,0,0,  s,0,0,  s,0,s,  0,0,0,  s,0,s,  0,0,s,
+            // +Y face
+            0,s,0,  0,s,s,  s,s,s,  0,s,0,  s,s,s,  s,s,0,
+            // -X face
+            0,0,0,  0,0,s,  0,s,s,  0,0,0,  0,s,s,  0,s,0,
+            // +X face
+            s,0,0,  s,s,0,  s,s,s,  s,0,0,  s,s,s,  s,0,s,
+        };
         glGenVertexArrays(1, &vao);
         glGenBuffers(1, &vbo);
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(quadv), quadv, GL_STATIC_DRAW);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(cube), cube, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
 
-        glGenTextures(1, &fieldTex);
-        glBindTexture(GL_TEXTURE_2D, fieldTex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenTextures(1, &volumeTex);
+        glBindTexture(GL_TEXTURE_3D, volumeTex);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
-        const char* vert = "#version 330 core\nlayout(location=0) in vec2 aPos; out vec2 vUV; void main(){ vUV=aPos*0.5+0.5; gl_Position=vec4(aPos,0,1); }";
-        const char* frag = R"glsl(
-            #version 330 core
-            in vec2 vUV; out vec4 FragColor;
-            uniform sampler2D u_Field;
-            uniform int u_ShowSpeed;
-            uniform float u_SpeedMax;
+        const char* vert = R"glsl(#version 330 core
+            layout(location=0) in vec3 aPos;
+            uniform mat4 u_MVP;
+            out vec3 vWorldPos;
             void main() {
+                vWorldPos = aPos;
+                gl_Position = u_MVP * vec4(aPos, 1.0);
+            }
+        )glsl";
+        const char* frag = R"glsl(#version 330 core
+            in vec3 vWorldPos;
+            out vec4 FragColor;
+            uniform sampler3D u_Volume;
+            uniform float u_StepScale;
+            uniform float u_BoxSize;
+            uniform float u_GridRes;
+            uniform float u_AlphaMul;
+            uniform vec3 u_CamPos;
+            void main() {
+                vec3 ro = u_CamPos;
+                vec3 rd = normalize(vWorldPos - ro);
+                vec3 t0 = (vec3(0.0) - ro) / rd;
+                vec3 t1 = (vec3(u_BoxSize) - ro) / rd;
+                vec3 tn = min(t0, t1), tf = max(t0, t1);
+                float tnear = max(max(tn.x, tn.y), tn.z);
+                float tfar  = min(min(tf.x, tf.y), tf.z);
+                if (tnear < 0.0) tnear = 0.0;
+                if (tnear >= tfar) discard;
+                float step = u_StepScale / u_GridRes;
                 vec3 bg = vec3(0.03, 0.04, 0.07);
-                if (u_ShowSpeed == 0) {
-                    float d = texture(u_Field, vUV).r;
-                    float a = clamp(d * 2.5, 0.0, 1.0);
-                    vec3 col = mix(bg, vec3(0.78, 0.80, 0.87), a);
-                    FragColor = vec4(col, 1.0);
+                vec3 smokeCol = vec3(0.9, 0.85, 0.75);
+                vec4 col = vec4(0.0);
+                bool hitSmoke = false;
+                for (float t = tnear; t < tfar; t += step) {
+                    float d = texture(u_Volume, (ro + rd * t) / u_BoxSize).r;
+                    if (d > 0.001) hitSmoke = true;
+                    float alpha = clamp(d * step * u_AlphaMul, 0.0, 1.0);
+                    col.rgb += (1.0 - col.a) * smokeCol * alpha;
+                    col.a += (1.0 - col.a) * alpha;
+                    if (col.a > 0.99) break;
+                }
+                if (hitSmoke) {
+                    FragColor = vec4(bg * (1.0 - col.a) + col.rgb, 1.0);
                 } else {
-                    float s = clamp(texture(u_Field, vUV).r / max(u_SpeedMax, 1e-4), 0.0, 1.0);
-                    vec3 c0 = vec3(0.05, 0.08, 0.15);
-                    vec3 c1 = vec3(0.0, 0.55, 0.85);
-                    vec3 c2 = vec3(0.95, 0.75, 0.15);
-                    vec3 col = s < 0.5 ? mix(c0, c1, s * 2.0) : mix(c1, c2, (s - 0.5) * 2.0);
-                    FragColor = vec4(col, 1.0);
+                    discard;
                 }
             }
         )glsl";
 
         auto compile = [](GLenum type, const char* s) {
             GLuint sh = glCreateShader(type);
-            glShaderSource(sh, 1, &s, nullptr);
-            glCompileShader(sh);
-            int ok = 0;
-            glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-            if (!ok) {
-                char log[1024];
-                glGetShaderInfoLog(sh, 1024, nullptr, log);
-                std::fprintf(stderr, "Shader compile error (%s): %s\n", type == GL_VERTEX_SHADER ? "VS" : "FS", log);
-            }
+            glShaderSource(sh, 1, &s, nullptr); glCompileShader(sh);
+            int ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+            if (!ok) { char log[1024]; glGetShaderInfoLog(sh, 1024, nullptr, log); std::fprintf(stderr, "GLSL %s compile: %s\n", type == GL_VERTEX_SHADER ? "VS" : "FS", log); }
             return sh;
-        };
+            };
         GLuint vs = compile(GL_VERTEX_SHADER, vert), fs = compile(GL_FRAGMENT_SHADER, frag);
         prog = glCreateProgram();
-        glAttachShader(prog, vs);
-        glAttachShader(prog, fs);
-        glLinkProgram(prog);
-        int linkOk = 0;
-        glGetProgramiv(prog, GL_LINK_STATUS, &linkOk);
-        if (!linkOk) {
-            char log[1024];
-            glGetProgramInfoLog(prog, 1024, nullptr, log);
-            std::fprintf(stderr, "Shader link error: %s\n", log);
-        }
-        glDeleteShader(vs);
-        glDeleteShader(fs);
+        glAttachShader(prog, vs); glAttachShader(prog, fs); glLinkProgram(prog);
+        int linkOk = 0; glGetProgramiv(prog, GL_LINK_STATUS, &linkOk);
+        if (!linkOk) { char log[1024]; glGetProgramInfoLog(prog, 1024, nullptr, log); std::fprintf(stderr, "Link: %s\n", log); }
+        glDeleteShader(vs); glDeleteShader(fs);
+    }
+
+    void setBoxSize(float boxSz) {
+        const float s = boxSz;
+        float cube[] = {
+            // -Z face
+            0,0,0,  0,s,0,  s,s,0,  0,0,0,  s,s,0,  s,0,0,
+            // +Z face
+            0,0,s,  s,0,s,  s,s,s,  0,0,s,  s,s,s,  0,s,s,
+            // -Y face
+            0,0,0,  s,0,0,  s,0,s,  0,0,0,  s,0,s,  0,0,s,
+            // +Y face
+            0,s,0,  0,s,s,  s,s,s,  0,s,0,  s,s,s,  s,s,0,
+            // -X face
+            0,0,0,  0,0,s,  0,s,s,  0,0,0,  0,s,s,  0,s,0,
+            // +X face
+            s,0,0,  s,s,0,  s,s,s,  s,0,0,  s,s,s,  s,0,s,
+        };
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(cube), cube, GL_STATIC_DRAW);
+    }
+
+    void upload(const std::vector<float>& density) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_3D, volumeTex);
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_R16F, n, n, n, 0, GL_RED, GL_FLOAT, density.data());
+    }
+
+    void render(int w, int h, const float* mvp, float cx, float cy, float cz, float stepScale, float boxSize, float alphaMul, FILE* logFile) {
+        glViewport(0, 0, w, h);
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_FRONT);
+        glUseProgram(prog);
+        glUniformMatrix4fv(glGetUniformLocation(prog, "u_MVP"), 1, GL_FALSE, mvp);
+        glUniform3f(glGetUniformLocation(prog, "u_CamPos"), cx, cy, cz);
+        glUniform1f(glGetUniformLocation(prog, "u_StepScale"), stepScale);
+        glUniform1f(glGetUniformLocation(prog, "u_BoxSize"), boxSize);
+        glUniform1f(glGetUniformLocation(prog, "u_GridRes"), float(n));
+        glUniform1f(glGetUniformLocation(prog, "u_AlphaMul"), alphaMul);
+        glUniform1i(glGetUniformLocation(prog, "u_Volume"), 0);
+        glBindTexture(GL_TEXTURE_3D, volumeTex);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDisable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
     }
 
     void shutdown() {
-        if (prog)  glDeleteProgram(prog);
-        if (vao)   glDeleteVertexArrays(1, &vao);
-        if (vbo)   glDeleteBuffers(1, &vbo);
-        if (fieldTex) glDeleteTextures(1, &fieldTex);
-        if (renderTex) glDeleteTextures(1, &renderTex);
-        if (fbo)   glDeleteFramebuffers(1, &fbo);
-        prog = vao = vbo = fieldTex = fbo = renderTex = 0;
-    }
-
-    void upload(const std::vector<float>& field, int n) {
-        glBindTexture(GL_TEXTURE_2D, fieldTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, n, n, 0, GL_RED, GL_FLOAT, field.data());
-    }
-
-    void render(int w, int h, bool showSpeed, float speedMax) {
-        if (w != texWidth || h != texHeight) {
-            texWidth = w;
-            texHeight = h;
-            if (!fbo) {
-                glGenFramebuffers(1, &fbo);
-                glGenTextures(1, &renderTex);
-            }
-            glBindTexture(GL_TEXTURE_2D, renderTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTex, 0);
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glViewport(0, 0, w, h);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glUseProgram(prog);
-        glUniform1i(glGetUniformLocation(prog, "u_Field"), 0);
-        glUniform1i(glGetUniformLocation(prog, "u_ShowSpeed"), showSpeed ? 1 : 0);
-        glUniform1f(glGetUniformLocation(prog, "u_SpeedMax"), speedMax);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, fieldTex);
-        glBindVertexArray(vao);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (prog) glDeleteProgram(prog);
+        if (vao) glDeleteVertexArrays(1, &vao);
+        if (vbo) glDeleteBuffers(1, &vbo);
+        if (volumeTex) glDeleteTextures(1, &volumeTex);
     }
 };
+
+static void buildMVP(float* m, float& cx, float& cy, float& cz, float azimuth, float elevation, float dist, float aspect, float boxSize) {
+    float cax = cosf(azimuth), sax = sinf(azimuth), cel = cosf(elevation), sel = sinf(elevation);
+    float half = boxSize * 0.5f;
+    cx = half + dist * cel * cax;
+    cy = half + dist * cel * sax;
+    cz = half + dist * sel;
+    float upx = -sel * cax, upy = -sel * sax, upz = cel;
+    float fx = half - cx, fy = half - cy, fz = half - cz, fl = sqrtf(fx * fx + fy * fy + fz * fz);
+    fx /= fl; fy /= fl; fz /= fl;
+    float rx = fy * upz - fz * upy, ry = fz * upx - fx * upz, rz = fx * upy - fy * upx;
+    float proj[16] = {};
+    float f = 1.0f / tanf(0.8f * 0.5f);
+    proj[0] = f / aspect; proj[5] = f; proj[10] = -101.f / 99.f; proj[11] = -1.f; proj[14] = -202.f / 99.f;
+    float view[16] = {};
+    view[0] = rx; view[4] = ry; view[8] = rz; view[12] = -(rx * cx + ry * cy + rz * cz);
+    view[1] = upx; view[5] = upy; view[9] = upz; view[13] = -(upx * cx + upy * cy + upz * cz);
+    view[2] = -fx; view[6] = -fy; view[10] = -fz; view[14] = fx * cx + fy * cy + fz * cz;
+    view[3] = 0; view[7] = 0; view[11] = 0; view[15] = 1.f;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            m[i + 4 * j] = 0;
+            for (int k = 0; k < 4; ++k) m[i + 4 * j] += proj[i + 4 * k] * view[k + 4 * j];
+        }
+}
 
 int main() {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    GLFWwindow* window = glfwCreateWindow(960, 960, "Vapor - 2D smoke plume", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(960, 960, "vapor", nullptr, nullptr);
     if (!window) return 1;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -673,22 +794,32 @@ int main() {
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
-    if (!loadOpenGLFunctions()) {
-        std::fprintf(stderr, "Failed to load required OpenGL 3.3 functions.\n");
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
+    if (!loadOpenGLFunctions()) { glfwDestroyWindow(window); glfwTerminate(); return 1; }
 
-    SmokeSim2D sim(256);
-    FieldRenderer renderer;
-    renderer.init();
+    SmokeSim3D sim(32);
+    VolumeRenderer renderer;
 
-    bool paused = false, showSpeed = false, useReflection = false, debugPrintOn = false;
-    float buoyancy = 0.8f, sourceStrength = 1.0f;
-    int projectIterations = 400;
+    FILE* logFile = std::fopen("vapor_console.log", "w");
+    auto logPrint = [&](const char* fmt, ...) {
+        va_list args1, args2;
+        va_start(args1, fmt); va_start(args2, fmt);
+        std::vprintf(fmt, args1);
+        if (logFile) { std::vfprintf(logFile, fmt, args2); std::fflush(logFile); }
+        va_end(args2); va_end(args1);
+        };
+
+    renderer.init(sim.n, sim.boxSize);
+
+    bool paused = false, useReflection = false, debugPrintOn = false;
+    float buoyancy = 5.0f, sourceStrength = 1.0f;
+    int projectIterations = sim.n * 2;
+    float alphaMul = 30.0f;
     int debugFrame = 0;
     const float maxDt = 0.033f;
+    float azimuth = -1.2f, elevation = 0.3f, dist = sim.boxSize * 2.5f, stepScale = 1.5f;
+    float prevBoxSize = sim.boxSize;
+    bool dragging = false;
+    double lastX = 0, lastY = 0;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -696,85 +827,101 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::SetNextWindowPos({ 0, 0 });
-        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-        ImGui::Begin("Sim", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus);
-
         if (!paused) {
             float dt = std::min(ImGui::GetIO().DeltaTime, maxDt);
-            if (useReflection)
-                sim.step(dt, buoyancy, sourceStrength, projectIterations);
-            else
-                sim.stepNoReflect(dt, buoyancy, sourceStrength, projectIterations);
-            if (debugPrintOn)
-                sim.debugPrint(++debugFrame);
+            if (useReflection) sim.step(dt, buoyancy, sourceStrength, projectIterations);
+            else sim.stepNoReflect(dt, buoyancy, sourceStrength, projectIterations);
+            if (debugPrintOn) {
+                ++debugFrame;
+                float dmax = *std::max_element(sim.smoke.begin(), sim.smoke.end());
+                float vmax = 0.f;
+                for (float v : sim.vz) vmax = std::max(vmax, std::abs(v));
+                logPrint("f %d maxSmoke=%.3f maxVz=%.2f\n", debugFrame, dmax, vmax);
+            }
         }
 
-        ImVec2 avail = ImGui::GetContentRegionAvail();
-        const float s = std::max(1.f, std::min(avail.x, avail.y));
-        ImVec2 size(s, s);
-        ImGui::SetCursorPos({ std::max(0.f, (avail.x - s) * 0.5f), std::max(0.f, (avail.y - s) * 0.5f) });
+        int w, h; glfwGetFramebufferSize(window, &w, &h);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glClearColor(0.03f, 0.04f, 0.07f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        const int m = sim.displayMargin, dispN = sim.n - 2 * m;
-        std::vector<float> view(dispN * dispN);
-        float speedMax = 1.f;
-        if (showSpeed) {
-            speedMax = 0.f;
-            for (int dy = 0; dy < dispN; ++dy)
-                for (int dx = 0; dx < dispN; ++dx) {
-                    const int x = dx + m, y = dy + m;
-                    const float ux = 0.5f * (sim.vx[sim.idX(x, y)] + sim.vx[sim.idX(x + 1, y)]);
-                    const float uy = 0.5f * (sim.vy[sim.idY(x, y)] + sim.vy[sim.idY(x, y + 1)]);
-                    const float sp = std::sqrt(ux * ux + uy * uy);
-                    view[dy * dispN + dx] = sp;
-                    speedMax = std::max(speedMax, sp);
+        renderer.upload(sim.smoke);
+        float mvp[16], cx, cy, cz;
+        buildMVP(mvp, cx, cy, cz, azimuth, elevation, dist, float(w) / float(h), sim.boxSize);
+        renderer.render(w, h, mvp, cx, cy, cz, stepScale, sim.boxSize, alphaMul, logFile);
+
+        if (debugPrintOn && debugFrame % 5 == 0) {
+            int ascW = 80, ascH = 24;
+            std::vector<unsigned char> full(w * h * 3);
+            glReadBuffer(GL_BACK);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, full.data());
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            logPrint("  framebuffer %dx%d:\n", w, h);
+            for (int ry = ascH - 1; ry >= 0; --ry) {
+                logPrint("  ");
+                for (int rx = 0; rx < ascW; ++rx) {
+                    int sx = rx * w / ascW;
+                    int sy = ry * h / ascH;
+                    int i = (sy * w + sx) * 3;
+                    float lum = 0.2126f * full[i] + 0.7152f * full[i + 1] + 0.0722f * full[i + 2];
+                    const char* ramp = " .:-=+*#%@";
+                    int idx = int(lum / 255.0f * 9.0f);
+                    idx = idx < 0 ? 0 : idx > 9 ? 9 : idx;
+                    logPrint("%c", ramp[idx]);
                 }
-        } else {
-            for (int dy = 0; dy < dispN; ++dy)
-                for (int dx = 0; dx < dispN; ++dx)
-                    view[dy * dispN + dx] = sim.smoke[sim.idC(dx + m, dy + m)];
+                logPrint("\n");
+            }
         }
-
-        renderer.upload(view, dispN);
-        renderer.render((int)size.x, (int)size.y, showSpeed, speedMax);
-        ImGui::Image((ImTextureID)(intptr_t)renderer.renderTex, size, { 0, 1 }, { 1, 0 });
-        ImGui::End();
 
         ImGui::SetNextWindowPos({ 16, 16 }, ImGuiCond_FirstUseEver);
         ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
         if (ImGui::Button(paused ? "Resume" : "Pause")) paused = !paused;
         ImGui::SameLine();
         if (ImGui::Button("Reset")) {
-            bool ol = sim.openLeft, orr = sim.openRight, ot = sim.openTop, ob = sim.openBottom;
-            bool ms = sim.macCormackSmoke, mv = sim.macCormackVel;
-            sim = SmokeSim2D(sim.n);
-            sim.openLeft = ol; sim.openRight = orr; sim.openTop = ot; sim.openBottom = ob;
-            sim.macCormackSmoke = ms; sim.macCormackVel = mv;
+            sim = SmokeSim3D(sim.n);
+            prevBoxSize = sim.boxSize;
+            renderer.setBoxSize(sim.boxSize);
+            dist = sim.boxSize * 2.5f;
         }
-        ImGui::Checkbox("Show velocity", &showSpeed);
         ImGui::Checkbox("Reflection", &useReflection);
-        ImGui::Checkbox("MacCormack smoke", &sim.macCormackSmoke);
-        ImGui::Checkbox("MacCormack vel", &sim.macCormackVel);
+        ImGui::Checkbox("MC smoke", &sim.macCormackSmoke);
+        ImGui::Checkbox("MC vel", &sim.macCormackVel);
         ImGui::Checkbox("Debug print", &debugPrintOn);
-        ImGui::SliderFloat("Buoyancy", &buoyancy, 0.0f, 10.0f);
-        ImGui::SliderFloat("Source", &sourceStrength, 0.0f, 3.0f);
-        ImGui::SliderInt("SOR iterations", &projectIterations, 10, 800);
-        ImGui::SliderFloat("MC CFL limit", &sim.cflMc, 0.5f, 10.0f);
-        ImGui::SeparatorText("Boundaries");
-        ImGui::Checkbox("Open left", &sim.openLeft);
-        ImGui::SameLine();
-        ImGui::Checkbox("Open right", &sim.openRight);
-        ImGui::Checkbox("Open top", &sim.openTop);
-        ImGui::SameLine();
-        ImGui::Checkbox("Open bottom", &sim.openBottom);
+        ImGui::SliderFloat("Buoyancy", &buoyancy, 0.f, 10.f);
+        ImGui::SliderFloat("Source", &sourceStrength, 0.f, 3.f);
+        ImGui::SliderFloat("Box size", &sim.boxSize, 0.5f, 5.f);
+        ImGui::SliderFloat("Emitt radius", &sim.emitterRadius, 0.05f, 0.5f);
+        ImGui::SliderFloat("Stir", &sim.stirStrength, 0.f, 2.f);
+        ImGui::SliderFloat("Alpha mul", &alphaMul, 5.f, 100.f);
+        ImGui::SliderInt("SOR its", &projectIterations, 10, 500);
+        ImGui::SliderFloat("MC CFL", &sim.cflMc, 0.5f, 10.f);
+        ImGui::SliderFloat("Step", &stepScale, 0.1f, 3.f);
+        ImGui::Text("Drag mouse to orbit, scroll to zoom");
+        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
         ImGui::End();
 
+        if (sim.boxSize != prevBoxSize) {
+            sim.rebox(prevBoxSize, sim.boxSize);
+            renderer.setBoxSize(sim.boxSize);
+            dist = sim.boxSize * 2.5f;
+            prevBoxSize = sim.boxSize;
+        }
+
         ImGui::Render();
-        int w, h;
-        glfwGetFramebufferSize(window, &w, &h);
-        glViewport(0, 0, w, h);
-        glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        if (!ImGui::GetIO().WantCaptureMouse && ImGui::GetIO().MouseWheel != 0.f) {
+            dist = std::clamp(dist - ImGui::GetIO().MouseWheel * dist * 0.1f, sim.boxSize * 0.3f, sim.boxSize * 8.f);
+        }
+
+        if (ImGui::IsMouseDown(0) && !ImGui::GetIO().WantCaptureMouse) {
+            double mx, my; glfwGetCursorPos(window, &mx, &my);
+            if (!dragging) { dragging = true; lastX = mx; lastY = my; }
+            else { azimuth += float((mx - lastX) * 0.005f); elevation = std::clamp(elevation + float((lastY - my) * 0.005f), -1.5f, 1.5f); lastX = mx; lastY = my; }
+        }
+        else dragging = false;
+
         glfwSwapBuffers(window);
     }
     ImGui_ImplOpenGL3_Shutdown();
@@ -783,4 +930,5 @@ int main() {
     renderer.shutdown();
     glfwDestroyWindow(window);
     glfwTerminate();
+    if (logFile) std::fclose(logFile);
 }
