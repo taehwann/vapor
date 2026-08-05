@@ -654,6 +654,9 @@ struct VolumeRenderer {
             uniform float u_GridRes;
             uniform float u_AlphaMul;
             uniform vec3 u_CamPos;
+            uniform vec3 u_LightDir;
+            uniform float u_ShadowStr;
+            uniform float u_ShadowStep;
             void main() {
                 vec3 ro = u_CamPos;
                 vec3 rd = normalize(vWorldPos - ro);
@@ -671,10 +674,24 @@ struct VolumeRenderer {
                 bool hitSmoke = false;
                 for (float t = tnear; t < tfar; t += step) {
                     float d = texture(u_Volume, (ro + rd * t) / u_BoxSize).r;
-                    if (d > 0.001) hitSmoke = true;
-                    float alpha = clamp(d * step * u_AlphaMul, 0.0, 1.0);
-                    col.rgb += (1.0 - col.a) * smokeCol * alpha;
-                    col.a += (1.0 - col.a) * alpha;
+                    if (d > 0.001) {
+                        hitSmoke = true;
+                        float shadow = 1.0;
+                        if (u_ShadowStr > 0.0) {
+                            vec3 spos = ro + rd * t;
+                            float sa = 0.0;
+                            for (float st = u_ShadowStep; st < u_BoxSize * 2.0; st += u_ShadowStep) {
+                                vec3 sp = spos + u_LightDir * st;
+                                if (sp.x < 0.0 || sp.x > u_BoxSize || sp.y < 0.0 || sp.y > u_BoxSize || sp.z < 0.0 || sp.z > u_BoxSize) break;
+                                sa += texture(u_Volume, sp / u_BoxSize).r * u_ShadowStep * u_AlphaMul * u_ShadowStr;
+                                if (sa > 3.0) break;
+                            }
+                            shadow = exp(-sa);
+                        }
+                        float alpha = clamp(d * step * u_AlphaMul, 0.0, 1.0);
+                        col.rgb += (1.0 - col.a) * smokeCol * alpha * shadow;
+                        col.a += (1.0 - col.a) * alpha;
+                    }
                     if (col.a > 0.99) break;
                 }
                 if (hitSmoke) {
@@ -726,7 +743,7 @@ struct VolumeRenderer {
         glTexImage3D(GL_TEXTURE_3D, 0, GL_R16F, n, n, n, 0, GL_RED, GL_FLOAT, density.data());
     }
 
-    void render(int w, int h, const float* mvp, float cx, float cy, float cz, float stepScale, float boxSize, float alphaMul, FILE* logFile) {
+    void render(int w, int h, const float* mvp, float cx, float cy, float cz, float stepScale, float boxSize, float alphaMul, float lightX, float lightY, float lightZ, float shadowStr, float shadowStep, FILE* logFile) {
         glViewport(0, 0, w, h);
         glDisable(GL_DEPTH_TEST);
         glEnable(GL_CULL_FACE);
@@ -738,6 +755,9 @@ struct VolumeRenderer {
         glUniform1f(glGetUniformLocation(prog, "u_BoxSize"), boxSize);
         glUniform1f(glGetUniformLocation(prog, "u_GridRes"), float(n));
         glUniform1f(glGetUniformLocation(prog, "u_AlphaMul"), alphaMul);
+        glUniform3f(glGetUniformLocation(prog, "u_LightDir"), lightX, lightY, lightZ);
+        glUniform1f(glGetUniformLocation(prog, "u_ShadowStr"), shadowStr);
+        glUniform1f(glGetUniformLocation(prog, "u_ShadowStep"), shadowStep);
         glUniform1i(glGetUniformLocation(prog, "u_Volume"), 0);
         glBindTexture(GL_TEXTURE_3D, volumeTex);
         glBindVertexArray(vao);
@@ -816,8 +836,10 @@ int main() {
     float alphaMul = 30.0f;
     int debugFrame = 0;
     const float maxDt = 0.033f;
-    float azimuth = -1.2f, elevation = 0.3f, dist = sim.boxSize * 2.5f, stepScale = 1.5f;
+    float azimuth = -1.2f, elevation = 0.3f, dist = sim.boxSize * 2.5f, stepScale = 0.5f;
     float prevBoxSize = sim.boxSize;
+    float lightX = 0.3f, lightY = 0.4f, lightZ = 1.0f;
+    float shadowStr = 0.3f, shadowStep = 0.1f;
     bool dragging = false;
     double lastX = 0, lastY = 0;
 
@@ -848,7 +870,9 @@ int main() {
         renderer.upload(sim.smoke);
         float mvp[16], cx, cy, cz;
         buildMVP(mvp, cx, cy, cz, azimuth, elevation, dist, float(w) / float(h), sim.boxSize);
-        renderer.render(w, h, mvp, cx, cy, cz, stepScale, sim.boxSize, alphaMul, logFile);
+        float ld = 1.0f / std::sqrt(lightX * lightX + lightY * lightY + lightZ * lightZ);
+        renderer.render(w, h, mvp, cx, cy, cz, stepScale, sim.boxSize, alphaMul,
+                        lightX * ld, lightY * ld, lightZ * ld, shadowStr, shadowStep, logFile);
 
         if (debugPrintOn && debugFrame % 5 == 0) {
             int ascW = 80, ascH = 24;
@@ -897,6 +921,9 @@ int main() {
         ImGui::SliderInt("SOR its", &projectIterations, 10, 500);
         ImGui::SliderFloat("MC CFL", &sim.cflMc, 0.5f, 10.f);
         ImGui::SliderFloat("Step", &stepScale, 0.1f, 3.f);
+        ImGui::SliderFloat("Shadow str", &shadowStr, 0.f, 5.f);
+        ImGui::SliderFloat("Shadow step", &shadowStep, 0.05f, 1.f);
+        ImGui::SliderFloat3("Light dir", &lightX, -1.f, 1.f);
         ImGui::Text("Drag mouse to orbit, scroll to zoom");
         ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
         ImGui::End();
