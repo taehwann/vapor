@@ -564,26 +564,26 @@ struct SmokeSim3D {
         const float halfDt = 0.5f * dt;
         const int halfIters = std::max(1, projectIterations / 2);
 
+        advectScalar(smoke, dt);
+
         applyBuoyancy(halfDt, buoyancy);
         emit(sourceStrength, halfDt);
-        advectScalar(smoke, halfDt);
 
         // Zero-allocation copy into preallocated scratch buffers
         vx0 = vx; vy0 = vy; vz0 = vz;
 
         advectVx(halfDt, vx0, vx0, vy0, vz0, vx);
         vxTilde = vx;
-        vx = vx0; vy = vy0; vz = vz0;
 
         advectVy(halfDt, vy0, vx0, vy0, vz0, vy);
         vyTilde = vy;
-        vx = vx0; vy = vy0; vz = vz0;
 
         advectVz(halfDt, vz0, vx0, vy0, vz0, vz);
         vzTilde = vz;
-        vx = vxTilde; vy = vyTilde;
 
+		vx = vxTilde; vy = vyTilde; vz = vzTilde;
         project(halfDt, halfIters);
+        // now vx vy vz = u^{1/2}
 
 #pragma omp parallel for
         for (int i = 0; i < (int)vx.size(); ++i) vxHat[i] = 2.f * vx[i] - vxTilde[i];
@@ -592,13 +592,11 @@ struct SmokeSim3D {
 #pragma omp parallel for
         for (int i = 0; i < (int)vz.size(); ++i) vzHat[i] = 2.f * vz[i] - vzTilde[i];
 
-        advectScalar(smoke, halfDt);
+        applyBuoyancy(halfDt, buoyancy);
+        emit(sourceStrength, halfDt);
         advectVx(halfDt, vxHat, vx, vy, vz, vx, macCormackVel);
         advectVy(halfDt, vyHat, vx, vy, vz, vy, macCormackVel);
         advectVz(halfDt, vzHat, vx, vy, vz, vz, macCormackVel);
-
-        applyBuoyancy(halfDt, buoyancy);
-        emit(sourceStrength, halfDt);
         project(halfDt, halfIters);
     }
 
