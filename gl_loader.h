@@ -52,6 +52,7 @@ using GLsizeiptr = std::ptrdiff_t;
     X(void, glLinkProgram, (GLuint)) \
     X(void, glDeleteShader, (GLuint)) \
     X(void, glTexImage3D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)) \
+    X(void, glTexSubImage3D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)) \
     X(void, glGenFramebuffers, (GLsizei, GLuint*)) \
     X(void, glDeleteFramebuffers, (GLsizei, GLuint*)) \
     X(void, glBindFramebuffer, (GLenum, GLuint)) \
