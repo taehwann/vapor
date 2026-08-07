@@ -21,19 +21,23 @@ static float frand() {
     state = state * 1664525u + 1013904223u;
     return (state >> 8) * (1.0f / 16777216.0f);
 }
+
 struct SmokeSim3D {
     int n = 64;
-    float boxSize = 3.0f;
-    float emitterRadius = 0.05f;
-    float emitterCenterX = 0.5f, emitterCenterY = 0.5f, emitterCenterZ = 0.15f;
-    float emitterKickBase = 1.2f;
-    float emitterKickScale = 1.0f;
-    float stirStrength = 0.6f;
+    // Spacious room defaults so smoke dissipates before hitting walls
+    float boxSize = 4.5f;
+    float emitterRadius = 0.035f;
+    float emitterCenterX = 0.5f, emitterCenterY = 0.5f, emitterCenterZ = 0.1f;
+    float emitterKickBase = 0.8f;
+    float emitterKickScale = 0.8f;
+    float stirStrength = 0.5f;
     float sorOmega = 1.95f;
     float buoyancySplit = 0.5f;
     float cflMc = 3.0f;
     bool macCormackSmoke = true, macCormackVel = true;
-    bool openXm = true, openXp = true, openYm = true, openYp = true, openZm = false, openZp = true;
+
+    // Dissipation tuned to fade out before reaching the top wall
+    float smokeDecay = 0.85f;
 
     std::vector<float> smoke, vx, vy, vz, pressure, divergence;
 
@@ -42,6 +46,7 @@ struct SmokeSim3D {
     std::vector<float> vx0, vy0, vz0;
     std::vector<float> vxTilde, vyTilde, vzTilde;
     std::vector<float> vxHat, vyHat, vzHat;
+    std::vector<float> vxDiv0, vyDiv0, vzDiv0;
 
     explicit SmokeSim3D(int res) {
         n = res;
@@ -88,9 +93,9 @@ struct SmokeSim3D {
     inline bool insideVz(int x, int y, int z) const { return x >= 0 && y >= 0 && z >= 0 && x < n && y < n && z <= n; }
 
     inline float sampleCell(const std::vector<float>& f, Vec3 p) const {
-        const float gx = std::clamp(p.x / h() - 0.5f, 0.f, float(n - 1));
-        const float gy = std::clamp(p.y / h() - 0.5f, 0.f, float(n - 1));
-        const float gz = std::clamp(p.z / h() - 0.5f, 0.f, float(n - 1));
+        float gx = std::clamp(p.x / h() - 0.5f, 0.f, float(n - 1));
+        float gy = std::clamp(p.y / h() - 0.5f, 0.f, float(n - 1));
+        float gz = std::clamp(p.z / h() - 0.5f, 0.f, float(n - 1));
         const int x0 = int(gx), y0 = int(gy), z0 = int(gz);
         const int x1 = std::min(x0 + 1, n - 1), y1 = std::min(y0 + 1, n - 1), z1 = std::min(z0 + 1, n - 1);
         const float tx = gx - x0, ty = gy - y0, tz = gz - z0;
@@ -424,18 +429,32 @@ struct SmokeSim3D {
         }
     }
 
-    void applyBoundary() {
-        if (!openXm) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(0, y, z)] = 0.f;
-        if (!openXp) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(n, y, z)] = 0.f;
-        if (!openYm) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, 0, z)] = 0.f;
-        if (!openYp) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, n, z)] = 0.f;
-        if (!openZm) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, 0)] = 0.f;
-        if (!openZp) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, n)] = 0.f;
+    // 100% Closed solid wall boundaries: enforce zero normal velocity at all 6 outer faces
+    void enforceVelocityBoundaries() {
+        for (int z = 0; z < n; ++z) {
+            for (int y = 0; y < n; ++y) {
+                vx[idX(0, y, z)] = 0.f;
+                vx[idX(n, y, z)] = 0.f;
+            }
+        }
+        for (int z = 0; z < n; ++z) {
+            for (int x = 0; x < n; ++x) {
+                vy[idY(x, 0, z)] = 0.f;
+                vy[idY(x, n, z)] = 0.f;
+            }
+        }
+        for (int y = 0; y < n; ++y) {
+            for (int x = 0; x < n; ++x) {
+                vz[idZ(x, y, 0)] = 0.f;
+                vz[idZ(x, y, n)] = 0.f;
+            }
+        }
     }
 
     void project(float dt, int iterations) {
         const float hInv = 1.0f / h(), h2 = h() * h();
-        applyBoundary();
+
+        enforceVelocityBoundaries();
 
 #pragma omp parallel for
         for (int z = 0; z < n; ++z) {
@@ -452,7 +471,7 @@ struct SmokeSim3D {
         const int dx[6] = { -1, 1, 0, 0, 0, 0 }, dy[6] = { 0, 0, -1, 1, 0, 0 }, dz[6] = { 0, 0, 0, 0, -1, 1 };
         const float omega = sorOmega;
 
-        // Branchless Red-Black SOR
+        // Branchless Red-Black SOR with pure Neumann (closed wall) boundary conditions
         for (int iter = 0; iter < iterations; ++iter) {
             for (int parity = 0; parity < 2; ++parity) {
 #pragma omp parallel for
@@ -465,7 +484,12 @@ struct SmokeSim3D {
                             int terms = 0;
                             for (int k = 0; k < 6; ++k) {
                                 int a = x + dx[k], b = y + dy[k], c = z + dz[k];
-                                if (!inside(a, b, c)) continue;
+                                if (!inside(a, b, c)) {
+                                    // Neumann boundary condition (dp/dn = 0) -> p_ghost == p_interior
+                                    sum += pressure[i];
+                                    ++terms;
+                                    continue;
+                                }
                                 ++terms;
                                 sum += pressure[idC(a, b, c)];
                             }
@@ -480,46 +504,32 @@ struct SmokeSim3D {
 #pragma omp parallel for
         for (int z = 0; z < n; ++z) {
             for (int y = 0; y < n; ++y) {
-                for (int x = 0; x <= n; ++x) {
-                    if ((x == 0 && !openXm) || (x == n && !openXp)) continue;
-                    float pRight = (x == n) ? 0.f : pressure[idC(x, y, z)];
-                    float pLeft = (x == 0) ? 0.f : pressure[idC(x - 1, y, z)];
-                    vx[idX(x, y, z)] -= dt * (pRight - pLeft) * hInv;
+                // Loop x from 1 to n-1 to strictly preserve vx=0 on outer boundary walls
+                for (int x = 1; x < n; ++x) {
+                    vx[idX(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x - 1, y, z)]) * hInv;
                 }
             }
         }
 
 #pragma omp parallel for
         for (int z = 0; z < n; ++z) {
-            for (int y = 0; y <= n; ++y) {
+            for (int y = 1; y < n; ++y) {
                 for (int x = 0; x < n; ++x) {
-                    if ((y == 0 && !openYm) || (y == n && !openYp)) continue;
-                    float pTop = (y == n) ? 0.f : pressure[idC(x, y, z)];
-                    float pBottom = (y == 0) ? 0.f : pressure[idC(x, y - 1, z)];
-                    vy[idY(x, y, z)] -= dt * (pTop - pBottom) * hInv;
+                    vy[idY(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x, y - 1, z)]) * hInv;
                 }
             }
         }
 
 #pragma omp parallel for
-        for (int z = 0; z <= n; ++z) {
+        for (int z = 1; z < n; ++z) {
             for (int y = 0; y < n; ++y) {
                 for (int x = 0; x < n; ++x) {
-                    if ((z == 0 && !openZm) || (z == n && !openZp)) continue;
-                    float pFront = (z == n) ? 0.f : pressure[idC(x, y, z)];
-                    float pBack = (z == 0) ? 0.f : pressure[idC(x, y, z - 1)];
-                    vz[idZ(x, y, z)] -= dt * (pFront - pBack) * hInv;
+                    vz[idZ(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x, y, z - 1)]) * hInv;
                 }
             }
         }
-        applyBoundary();
 
-        if (openXm) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(0, y, z)] = std::min(vx[idX(0, y, z)], 0.f);
-        if (openXp) for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) vx[idX(n, y, z)] = std::max(vx[idX(n, y, z)], 0.f);
-        if (openYm) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, 0, z)] = std::min(vy[idY(x, 0, z)], 0.f);
-        if (openYp) for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) vy[idY(x, n, z)] = std::max(vy[idY(x, n, z)], 0.f);
-        if (openZm) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, 0)] = std::min(vz[idZ(x, y, 0)], 0.f);
-        if (openZp) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) vz[idZ(x, y, n)] = std::max(vz[idZ(x, y, n)], 0.f);
+        enforceVelocityBoundaries();
     }
 
     void emit(float strength, float dt) {
@@ -553,10 +563,21 @@ struct SmokeSim3D {
             for (int y = 0; y < n; ++y) {
                 for (int x = 0; x < n; ++x) {
                     const float f = buoyancyVal * smoke[idC(x, y, z)] * dtStep;
-                    vz[idZ(x, y, z)] += buoyancySplit * f;
-                    vz[idZ(x, y, z + 1)] += buoyancySplit * f;
+                    // Skip bottom (z==0) and top (z==n) solid wall faces
+                    if (z > 0)     vz[idZ(x, y, z)] += buoyancySplit * f;
+                    if (z < n - 1) vz[idZ(x, y, z + 1)] += buoyancySplit * f;
                 }
             }
+        }
+    }
+
+    // Pure smoke density dissipation (velocity remains divergence-free and inviscid)
+    void applyDissipation(float dt) {
+        const float sFactor = std::clamp(1.0f - smokeDecay * dt, 0.0f, 1.0f);
+
+#pragma omp parallel for
+        for (int i = 0; i < (int)smoke.size(); ++i) {
+            smoke[i] *= sFactor;
         }
     }
 
@@ -564,12 +585,10 @@ struct SmokeSim3D {
         const float halfDt = 0.5f * dt;
         const int halfIters = std::max(1, projectIterations / 2);
 
-        advectScalar(smoke, dt);
+        emit(sourceStrength, dt);
+        applyBuoyancy(dt, buoyancy);
+        enforceVelocityBoundaries();
 
-        applyBuoyancy(halfDt, buoyancy);
-        emit(sourceStrength, halfDt);
-
-        // Zero-allocation copy into preallocated scratch buffers
         vx0 = vx; vy0 = vy; vz0 = vz;
 
         advectVx(halfDt, vx0, vx0, vy0, vz0, vx);
@@ -581,9 +600,9 @@ struct SmokeSim3D {
         advectVz(halfDt, vz0, vx0, vy0, vz0, vz);
         vzTilde = vz;
 
-		vx = vxTilde; vy = vyTilde; vz = vzTilde;
         project(halfDt, halfIters);
-        // now vx vy vz = u^{1/2}
+
+        vxDiv0 = vx; vyDiv0 = vy; vzDiv0 = vz;
 
 #pragma omp parallel for
         for (int i = 0; i < (int)vx.size(); ++i) vxHat[i] = 2.f * vx[i] - vxTilde[i];
@@ -592,23 +611,65 @@ struct SmokeSim3D {
 #pragma omp parallel for
         for (int i = 0; i < (int)vz.size(); ++i) vzHat[i] = 2.f * vz[i] - vzTilde[i];
 
-        applyBuoyancy(halfDt, buoyancy);
-        emit(sourceStrength, halfDt);
-        advectVx(halfDt, vxHat, vx, vy, vz, vx, macCormackVel);
-        advectVy(halfDt, vyHat, vx, vy, vz, vy, macCormackVel);
-        advectVz(halfDt, vzHat, vx, vy, vz, vz, macCormackVel);
+        advectVx(halfDt, vxHat, vxDiv0, vyDiv0, vzDiv0, vx, macCormackVel);
+        advectVy(halfDt, vyHat, vxDiv0, vyDiv0, vzDiv0, vy, macCormackVel);
+        advectVz(halfDt, vzHat, vxDiv0, vyDiv0, vzDiv0, vz, macCormackVel);
+
         project(halfDt, halfIters);
+
+        advectScalar(smoke, dt);
+        applyDissipation(dt);
     }
 
     void stepNoReflect(float dt, float buoyancy, float sourceStrength, int projectIterations) {
-        advectScalar(smoke, dt);
+        emit(sourceStrength, dt);
+        applyBuoyancy(dt, buoyancy);
+        enforceVelocityBoundaries();
+
         vx0 = vx; vy0 = vy; vz0 = vz;
         advectVx(dt, vx0, vx0, vy0, vz0, vx);
         advectVy(dt, vy0, vx0, vy0, vz0, vy);
         advectVz(dt, vz0, vx0, vy0, vz0, vz);
-        applyBuoyancy(dt, buoyancy);
-        emit(sourceStrength, dt);
+
         project(dt, projectIterations);
+        advectScalar(smoke, dt);
+        applyDissipation(dt);
+    }
+
+    float kineticEnergy() const {
+        const float dx = h();
+        double ke = 0.0;
+        for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) for (int x = 0; x <= n; ++x)
+            ke += (double)vx[idX(x, y, z)] * vx[idX(x, y, z)];
+        for (int z = 0; z < n; ++z) for (int y = 0; y <= n; ++y) for (int x = 0; x < n; ++x)
+            ke += (double)vy[idY(x, y, z)] * vy[idY(x, y, z)];
+        for (int z = 0; z <= n; ++z) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x)
+            ke += (double)vz[idZ(x, y, z)] * vz[idZ(x, y, z)];
+        return float(0.5 * ke * dx * dx * dx);
+    }
+
+    float maxVelocity() const {
+        float m = 0.f;
+        for (float f : vx) m = std::max(m, std::abs(f));
+        for (float f : vy) m = std::max(m, std::abs(f));
+        for (float f : vz) m = std::max(m, std::abs(f));
+        return m;
+    }
+
+    float computeDivergenceNorm() {
+        const float hInv = 1.0f / h();
+        float maxDiv = 0.f;
+        for (int z = 0; z < n; ++z) {
+            for (int y = 0; y < n; ++y) {
+                for (int x = 0; x < n; ++x) {
+                    float div = std::abs((vx[idX(x + 1, y, z)] - vx[idX(x, y, z)] +
+                        vy[idY(x, y + 1, z)] - vy[idY(x, y, z)] +
+                        vz[idZ(x, y, z + 1)] - vz[idZ(x, y, z)]) * hInv);
+                    maxDiv = std::max(maxDiv, div);
+                }
+            }
+        }
+        return maxDiv;
     }
 
     void rebox(float oldSz, float newSz) {
@@ -660,7 +721,6 @@ struct VolumeRenderer {
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
-        // Preallocate GPU texture storage once
         glTexImage3D(GL_TEXTURE_3D, 0, GL_R16F, n, n, n, 0, GL_RED, GL_FLOAT, nullptr);
 
         const char* vert = R"glsl(#version 330 core
@@ -747,7 +807,6 @@ struct VolumeRenderer {
     void upload(const std::vector<float>& density) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_3D, volumeTex);
-        // Using SubImage prevents driver memory re-allocations per frame
         glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, n, n, n, GL_RED, GL_FLOAT, density.data());
     }
 
@@ -858,8 +917,9 @@ int main() {
 
     renderer.init(sim.n, sim.boxSize);
 
-    bool paused = false, useReflection = false, debugPrintOn = false;
-    float buoyancy = 5.0f, sourceStrength = 1.0f;
+    bool paused = false, useReflection = true, debugPrintOn = true;
+    int maxFrames = 600;
+    float buoyancy = 2.5f, sourceStrength = 1.0f;
     int projectIterations = sim.n * 2;
     float alphaMul = 30.0f;
     int debugFrame = 0;
@@ -884,9 +944,16 @@ int main() {
             if (debugPrintOn) {
                 ++debugFrame;
                 float dmax = *std::max_element(sim.smoke.begin(), sim.smoke.end());
-                float vmax = 0.f;
-                for (float v : sim.vz) vmax = std::max(vmax, std::abs(v));
-                logPrint("f %d maxSmoke=%.3f maxVz=%.2f\n", debugFrame, dmax, vmax);
+                float ke = sim.kineticEnergy();
+                float maxDiv = sim.computeDivergenceNorm();
+                float maxV = sim.maxVelocity();
+                logPrint("f %4d | ke=%.6f maxDiv=%.6f maxV=%.3f smoke=%.3f | %s\n",
+                    debugFrame, ke, maxDiv, maxV, dmax,
+                    useReflection ? "REFLECT" : "NOREFLECT");
+            }
+            if (maxFrames > 0 && debugFrame >= maxFrames) {
+                logPrint("--- AUTO-QUIT after %d frames ---\n", maxFrames);
+                glfwSetWindowShouldClose(window, GLFW_TRUE);
             }
         }
 
@@ -900,7 +967,7 @@ int main() {
         buildMVP(mvp, cx, cy, cz, azimuth, elevation, dist, float(w) / float(h), sim.boxSize);
         float ld = 1.0f / std::sqrt(lightX * lightX + lightY * lightY + lightZ * lightZ);
         renderer.render(w, h, mvp, cx, cy, cz, stepScale, sim.boxSize, alphaMul,
-                        lightX * ld, lightY * ld, lightZ * ld, shadowStr, shadowStep, logFile);
+            lightX * ld, lightY * ld, lightZ * ld, shadowStr, shadowStep, logFile);
 
         if (debugPrintOn && debugFrame % 5 == 0) {
             int ascW = 80, ascH = 24;
@@ -942,8 +1009,9 @@ int main() {
         ImGui::Checkbox("Debug print", &debugPrintOn);
         ImGui::SliderFloat("Buoyancy", &buoyancy, 0.f, 10.f);
         ImGui::SliderFloat("Source", &sourceStrength, 0.f, 3.f);
-        ImGui::SliderFloat("Box size", &sim.boxSize, 0.5f, 5.f);
-        ImGui::SliderFloat("Emitt radius", &sim.emitterRadius, 0.05f, 0.5f);
+        ImGui::SliderFloat("Smoke decay", &sim.smokeDecay, 0.f, 2.f);
+        ImGui::SliderFloat("Box size", &sim.boxSize, 0.5f, 8.f);
+        ImGui::SliderFloat("Emitt radius", &sim.emitterRadius, 0.01f, 0.2f);
         ImGui::SliderFloat("Stir", &sim.stirStrength, 0.f, 2.f);
         ImGui::SliderFloat("Alpha mul", &alphaMul, 5.f, 100.f);
         ImGui::SliderInt("SOR its", &projectIterations, 10, 500);
