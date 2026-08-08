@@ -1,10 +1,11 @@
 # Vapor
 
 An interactive **3D smoke-plume** simulation written in C++20, rendered with OpenGL
-3.3 volume ray-marching and Dear ImGui. The solver integrates the incompressible
+4.3 volume ray-marching and Dear ImGui. The solver integrates the incompressible
 Navier–Stokes equations on a **closed-box** staggered (MAC) grid using semi-Lagrangian
 advection, an optional midpoint-reflect (Richardson extrapolation) velocity update,
-and a red-black SOR pressure solve.
+and a red-black SOR pressure solve. The SOR solve can be toggled between CPU
+(OpenMP-parallelised) and GPU (OpenGL 4.3 compute shader) at runtime.
 
 ---
 
@@ -170,7 +171,13 @@ also disables MacCormack correction for cells with very high velocity.
 ## Pressure projection — Neumann boundary conditions
 
 The pressure Poisson equation `Δp = ∇·u / dt` is solved with a **Red-Black
-Gauss-Seidel SOR** method.
+Gauss-Seidel SOR** method. Two backends are available, toggleable via the
+"GPU SOR" checkbox:
+
+| Backend | Description |
+|---------|-------------|
+| **CPU** (default) | OpenMP-parallelised red-black SOR, runs on host. Same algorithm as GPU. |
+| **GPU** | OpenGL 4.3 compute shaders with SSBOs. Divergence, SOR, and velocity correction run entirely on the GPU via `glDispatchCompute`. Data is uploaded before and downloaded after each `project()` call. |
 
 ### Divergence computation
 
@@ -320,7 +327,7 @@ using the ramp ` .:-=+*#%@` (dark to bright).
 
 ## Build
 
-Requires CMake ≥ 3.20, a C++20 compiler, and OpenGL 3.3. GLFW and Dear ImGui are
+Requires CMake ≥ 3.20, a C++20 compiler, and OpenGL 4.3. GLFW and Dear ImGui are
 included as git submodules under `dependency/`.
 
 ```powershell
@@ -345,6 +352,7 @@ Visual Studio 2022 builds with `MSBuild` are also supported (tested with
 | MC smoke         | true       | bool       | Toggle MacCormack correction for smoke advection |
 | MC vel           | true       | bool       | Toggle MacCormack correction for velocity        |
 | Debug print      | true       | bool       | Log diagnostic stats and ASCII framebuffer       |
+| GPU SOR          | false      | bool       | Run SOR pressure solve on GPU via compute shaders|
 | Buoyancy         | 2.5        | 0–10       | Upward force strength                            |
 | Source           | 1.0        | 0–3        | Emitter injection multiplier                     |
 | Smoke decay      | 0.85       | 0–2        | Per-frame density dissipation rate               |
@@ -377,8 +385,8 @@ Every 5 frames, an 80×24 ASCII frame dump is appended.
 
 | File            | Purpose                                             |
 | --------------- | --------------------------------------------------- |
-| `main.cpp`      | `SmokeSim3D` (solver), `VolumeRenderer`, UI loop    |
-| `gl_loader.h`   | Loads OpenGL 3.3 entry points at runtime            |
+| `main.cpp`      | `SmokeSim3D` (solver), `GpuSORSolver`, `VolumeRenderer`, UI loop |
+| `gl_loader.h`   | Loads OpenGL 4.3 entry points at runtime (compute shader support) |
 | `dependency/`   | GLFW and Dear ImGui submodules                      |
 | `build/`        | CMake build output                                  |
 | `vapor_console.log` | Runtime diagnostic log (git-ignored)           |

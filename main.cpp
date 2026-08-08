@@ -22,6 +22,191 @@ static float frand() {
     return (state >> 8) * (1.0f / 16777216.0f);
 }
 
+static GLuint compileComputeShader(const char* src) {
+    GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+    int ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetShaderInfoLog(sh, 1024, nullptr, log); std::fprintf(stderr, "Compute compile: %s\n", log); }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, sh);
+    glLinkProgram(prog);
+    int linkOk = 0; glGetProgramiv(prog, GL_LINK_STATUS, &linkOk);
+    if (!linkOk) { char log[1024]; glGetProgramInfoLog(prog, 1024, nullptr, log); std::fprintf(stderr, "Compute link: %s\n", log); }
+    glDeleteShader(sh);
+    return prog;
+}
+
+struct GpuSORSolver {
+    GLuint progDiv = 0, progRBGS = 0, progCorrect = 0;
+    GLuint ssboP = 0, ssboDiv = 0, ssboVx = 0, ssboVy = 0, ssboVz = 0;
+    int n = 0, vxSz = 0, vySz = 0, vzSz = 0;
+    bool enabled = false;
+
+    void init(int res, int vxSize, int vySize, int vzSize) {
+        n = res; vxSz = vxSize; vySz = vySize; vzSz = vzSize;
+        if (!glDispatchCompute) { enabled = false; return; }
+
+        const char* divSrc = R"glsl(#version 430 core
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+layout(std430, binding = 0) buffer VxBuf { float vx[]; };
+layout(std430, binding = 1) buffer VyBuf { float vy[]; };
+layout(std430, binding = 2) buffer VzBuf { float vz[]; };
+layout(std430, binding = 3) buffer DivBuf { float div[]; };
+uniform int u_n, u_n1; uniform float u_hInv;
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), z = int(gl_GlobalInvocationID.z);
+    if (x >= u_n || y >= u_n || z >= u_n) return;
+    int idxC = x + u_n * (y + u_n * z);
+    int idxX0 = x + u_n1 * (y + u_n * z), idxX1 = (x+1) + u_n1 * (y + u_n * z);
+    int idxY0 = x + u_n * (y + u_n1 * z), idxY1 = x + u_n * ((y+1) + u_n1 * z);
+    int idxZ0 = x + u_n * (y + u_n * z), idxZ1 = x + u_n * (y + u_n * (z+1));
+    div[idxC] = (vx[idxX1] - vx[idxX0] + vy[idxY1] - vy[idxY0] + vz[idxZ1] - vz[idxZ0]) * u_hInv;
+}
+)glsl";
+
+        const char* rbgsSrc = R"glsl(#version 430 core
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(std430, binding = 0) buffer PBuf { float p[]; };
+layout(std430, binding = 1) buffer DBuf { float div[]; };
+uniform int u_n, u_parity; uniform float u_omega, u_h2_div_dt;
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), z = int(gl_GlobalInvocationID.z);
+    if (x >= u_n || y >= u_n || z >= u_n) return;
+    if (((x + y + z) & 1) != u_parity) return;
+    const ivec3 nb[6] = { ivec3(-1,0,0), ivec3(1,0,0), ivec3(0,-1,0), ivec3(0,1,0), ivec3(0,0,-1), ivec3(0,0,1) };
+    int i = x + u_n * (y + u_n * z);
+    float sum = 0.0; int terms = 0;
+    for (int k = 0; k < 6; ++k) {
+        int nx = x + nb[k].x, ny = y + nb[k].y, nz = z + nb[k].z;
+        if (nx < 0 || nx >= u_n || ny < 0 || ny >= u_n || nz < 0 || nz >= u_n) { sum += p[i]; ++terms; }
+        else { sum += p[nx + u_n * (ny + u_n * nz)]; ++terms; }
+    }
+    p[i] = (1.0 - u_omega) * p[i] + u_omega * (sum - div[i] * u_h2_div_dt) / float(max(terms, 1));
+}
+)glsl";
+
+        const char* correctSrc = R"glsl(#version 430 core
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(std430, binding = 0) buffer VxBuf { float vx[]; };
+layout(std430, binding = 1) buffer VyBuf { float vy[]; };
+layout(std430, binding = 2) buffer VzBuf { float vz[]; };
+layout(std430, binding = 3) buffer PBuf { float p[]; };
+uniform int u_n, u_mode, u_n1; uniform float u_dt, u_hInv;
+int idC(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+int idX(int x, int y, int z) { return x + u_n1 * (y + u_n * z); }
+int idY(int x, int y, int z) { return x + u_n * (y + u_n1 * z); }
+int idZ(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), z = int(gl_GlobalInvocationID.z);
+    if (u_mode == 0) { if (x < 1 || x >= u_n || y >= u_n || z >= u_n) return; vx[idX(x,y,z)] -= u_dt * (p[idC(x,y,z)] - p[idC(x-1,y,z)]) * u_hInv; }
+    else if (u_mode == 1) { if (x >= u_n || y < 1 || y >= u_n || z >= u_n) return; vy[idY(x,y,z)] -= u_dt * (p[idC(x,y,z)] - p[idC(x,y-1,z)]) * u_hInv; }
+    else if (u_mode == 2) { if (x >= u_n || y >= u_n || z < 1 || z >= u_n) return; vz[idZ(x,y,z)] -= u_dt * (p[idC(x,y,z)] - p[idC(x,y,z-1)]) * u_hInv; }
+}
+)glsl";
+
+        progDiv = compileComputeShader(divSrc);
+        progRBGS = compileComputeShader(rbgsSrc);
+        progCorrect = compileComputeShader(correctSrc);
+
+        auto newSSBO = [](GLuint& handle, int count) {
+            glGenBuffers(1, &handle);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, handle);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)count * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+            };
+
+        newSSBO(ssboP, n * n * n);
+        newSSBO(ssboDiv, n * n * n);
+        newSSBO(ssboVx, vxSz);
+        newSSBO(ssboVy, vySz);
+        newSSBO(ssboVz, vzSz);
+
+        enabled = true;
+    }
+
+    void project(float dt, int iterations, float omega, float hInv, float h,
+        const float* vxData, const float* vyData, const float* vzData,
+        float* vxOut, float* vyOut, float* vzOut) {
+        const int N = n * n * n;
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVx);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vxSz * sizeof(float), vxData);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVy);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vySz * sizeof(float), vyData);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVz);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vzSz * sizeof(float), vzData);
+
+        std::vector<float> zeroP(N, 0.f);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboP);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)N * sizeof(float), zeroP.data());
+
+        glUseProgram(progDiv);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboVx);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboVy);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssboVz);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssboDiv);
+        glUniform1i(glGetUniformLocation(progDiv, "u_n"), n);
+        glUniform1i(glGetUniformLocation(progDiv, "u_n1"), n + 1);
+        glUniform1f(glGetUniformLocation(progDiv, "u_hInv"), hInv);
+        glDispatchCompute((n + 7) / 8, (n + 7) / 8, (n + 3) / 4);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glUseProgram(progRBGS);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboP);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboDiv);
+        glUniform1i(glGetUniformLocation(progRBGS, "u_n"), n);
+        glUniform1f(glGetUniformLocation(progRBGS, "u_omega"), omega);
+        glUniform1f(glGetUniformLocation(progRBGS, "u_h2_div_dt"), h * h / dt);
+        int gX = (n + 3) / 4, gY = (n + 3) / 4, gZ = (n + 3) / 4;
+        for (int iter = 0; iter < iterations; ++iter) {
+            glUniform1i(glGetUniformLocation(progRBGS, "u_parity"), 0);
+            glDispatchCompute(gX, gY, gZ);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            glUniform1i(glGetUniformLocation(progRBGS, "u_parity"), 1);
+            glDispatchCompute(gX, gY, gZ);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+
+        glUseProgram(progCorrect);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboVx);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboVy);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssboVz);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssboP);
+        glUniform1i(glGetUniformLocation(progCorrect, "u_n"), n);
+        glUniform1i(glGetUniformLocation(progCorrect, "u_n1"), n + 1);
+        glUniform1f(glGetUniformLocation(progCorrect, "u_dt"), dt);
+        glUniform1f(glGetUniformLocation(progCorrect, "u_hInv"), hInv);
+
+        glUniform1i(glGetUniformLocation(progCorrect, "u_mode"), 0);
+        glDispatchCompute(gX, gY, gZ);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        glUniform1i(glGetUniformLocation(progCorrect, "u_mode"), 1);
+        glDispatchCompute(gX, gY, gZ);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        glUniform1i(glGetUniformLocation(progCorrect, "u_mode"), 2);
+        glDispatchCompute(gX, gY, gZ);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVx);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vxSz * sizeof(float), vxOut);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVy);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vySz * sizeof(float), vyOut);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVz);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vzSz * sizeof(float), vzOut);
+    }
+
+    void shutdown() {
+        if (progDiv) glDeleteProgram(progDiv);
+        if (progRBGS) glDeleteProgram(progRBGS);
+        if (progCorrect) glDeleteProgram(progCorrect);
+        if (ssboP) glDeleteBuffers(1, &ssboP);
+        if (ssboDiv) glDeleteBuffers(1, &ssboDiv);
+        if (ssboVx) glDeleteBuffers(1, &ssboVx);
+        if (ssboVy) glDeleteBuffers(1, &ssboVy);
+        if (ssboVz) glDeleteBuffers(1, &ssboVz);
+    }
+};
+
 struct SmokeSim3D {
     int n = 64;
     // Spacious room defaults so smoke dissipates before hitting walls
@@ -37,7 +222,7 @@ struct SmokeSim3D {
     bool macCormackSmoke = true, macCormackVel = true;
 
     // Dissipation tuned to fade out before reaching the top wall
-    float smokeDecay = 0.85f;
+    float smokeDecay = 0.06f;
 
     std::vector<float> smoke, vx, vy, vz, pressure, divergence;
 
@@ -47,6 +232,8 @@ struct SmokeSim3D {
     std::vector<float> vxTilde, vyTilde, vzTilde;
     std::vector<float> vxHat, vyHat, vzHat;
     std::vector<float> vxDiv0, vyDiv0, vzDiv0;
+
+    GpuSORSolver gpuSolver;
 
     explicit SmokeSim3D(int res) {
         n = res;
@@ -80,6 +267,8 @@ struct SmokeSim3D {
         vxHat.assign(NX, 0.f);
         vyHat.assign(NY, 0.f);
         vzHat.assign(NZ, 0.f);
+
+        gpuSolver.init(n, (int)vx.size(), (int)vy.size(), (int)vz.size());
     }
 
     inline int idC(int x, int y, int z) const { return x + n * (y + n * z); }
@@ -456,75 +645,78 @@ struct SmokeSim3D {
 
         enforceVelocityBoundaries();
 
+        if (gpuSolver.enabled) {
+            gpuSolver.project(dt, iterations, sorOmega, hInv, h(),
+                vx.data(), vy.data(), vz.data(),
+                vx.data(), vy.data(), vz.data());
+        } else {
 #pragma omp parallel for
-        for (int z = 0; z < n; ++z) {
-            for (int y = 0; y < n; ++y) {
-                for (int x = 0; x < n; ++x) {
-                    divergence[idC(x, y, z)] = (vx[idX(x + 1, y, z)] - vx[idX(x, y, z)] +
-                        vy[idY(x, y + 1, z)] - vy[idY(x, y, z)] +
-                        vz[idZ(x, y, z + 1)] - vz[idZ(x, y, z)]) * hInv;
+            for (int z = 0; z < n; ++z) {
+                for (int y = 0; y < n; ++y) {
+                    for (int x = 0; x < n; ++x) {
+                        divergence[idC(x, y, z)] = (vx[idX(x + 1, y, z)] - vx[idX(x, y, z)] +
+                            vy[idY(x, y + 1, z)] - vy[idY(x, y, z)] +
+                            vz[idZ(x, y, z + 1)] - vz[idZ(x, y, z)]) * hInv;
+                    }
                 }
             }
-        }
 
-        std::fill(pressure.begin(), pressure.end(), 0.f);
-        const int dx[6] = { -1, 1, 0, 0, 0, 0 }, dy[6] = { 0, 0, -1, 1, 0, 0 }, dz[6] = { 0, 0, 0, 0, -1, 1 };
-        const float omega = sorOmega;
+            std::fill(pressure.begin(), pressure.end(), 0.f);
+            const int dx[6] = { -1, 1, 0, 0, 0, 0 }, dy[6] = { 0, 0, -1, 1, 0, 0 }, dz[6] = { 0, 0, 0, 0, -1, 1 };
+            const float omega = sorOmega;
 
-        // Branchless Red-Black SOR with pure Neumann (closed wall) boundary conditions
-        for (int iter = 0; iter < iterations; ++iter) {
-            for (int parity = 0; parity < 2; ++parity) {
+            for (int iter = 0; iter < iterations; ++iter) {
+                for (int parity = 0; parity < 2; ++parity) {
 #pragma omp parallel for
-                for (int z = 0; z < n; ++z) {
-                    for (int y = 0; y < n; ++y) {
-                        int xStart = (y + z + parity) & 1;
-                        for (int x = xStart; x < n; x += 2) {
-                            const int i = idC(x, y, z);
-                            float sum = 0.f;
-                            int terms = 0;
-                            for (int k = 0; k < 6; ++k) {
-                                int a = x + dx[k], b = y + dy[k], c = z + dz[k];
-                                if (!inside(a, b, c)) {
-                                    // Neumann boundary condition (dp/dn = 0) -> p_ghost == p_interior
-                                    sum += pressure[i];
+                    for (int z = 0; z < n; ++z) {
+                        for (int y = 0; y < n; ++y) {
+                            int xStart = (y + z + parity) & 1;
+                            for (int x = xStart; x < n; x += 2) {
+                                const int i = idC(x, y, z);
+                                float sum = 0.f;
+                                int terms = 0;
+                                for (int k = 0; k < 6; ++k) {
+                                    int a = x + dx[k], b = y + dy[k], c = z + dz[k];
+                                    if (!inside(a, b, c)) {
+                                        sum += pressure[i];
+                                        ++terms;
+                                        continue;
+                                    }
                                     ++terms;
-                                    continue;
+                                    sum += pressure[idC(a, b, c)];
                                 }
-                                ++terms;
-                                sum += pressure[idC(a, b, c)];
+                                pressure[i] = (1.f - omega) * pressure[i] +
+                                    omega * (sum - divergence[i] * h2 / dt) / std::max(terms, 1);
                             }
-                            pressure[i] = (1.f - omega) * pressure[i] +
-                                omega * (sum - divergence[i] * h2 / dt) / std::max(terms, 1);
                         }
                     }
                 }
             }
-        }
 
 #pragma omp parallel for
-        for (int z = 0; z < n; ++z) {
-            for (int y = 0; y < n; ++y) {
-                // Loop x from 1 to n-1 to strictly preserve vx=0 on outer boundary walls
-                for (int x = 1; x < n; ++x) {
-                    vx[idX(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x - 1, y, z)]) * hInv;
+            for (int z = 0; z < n; ++z) {
+                for (int y = 0; y < n; ++y) {
+                    for (int x = 1; x < n; ++x) {
+                        vx[idX(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x - 1, y, z)]) * hInv;
+                    }
                 }
             }
-        }
 
 #pragma omp parallel for
-        for (int z = 0; z < n; ++z) {
-            for (int y = 1; y < n; ++y) {
-                for (int x = 0; x < n; ++x) {
-                    vy[idY(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x, y - 1, z)]) * hInv;
+            for (int z = 0; z < n; ++z) {
+                for (int y = 1; y < n; ++y) {
+                    for (int x = 0; x < n; ++x) {
+                        vy[idY(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x, y - 1, z)]) * hInv;
+                    }
                 }
             }
-        }
 
 #pragma omp parallel for
-        for (int z = 1; z < n; ++z) {
-            for (int y = 0; y < n; ++y) {
-                for (int x = 0; x < n; ++x) {
-                    vz[idZ(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x, y, z - 1)]) * hInv;
+            for (int z = 1; z < n; ++z) {
+                for (int y = 0; y < n; ++y) {
+                    for (int x = 0; x < n; ++x) {
+                        vz[idZ(x, y, z)] -= dt * (pressure[idC(x, y, z)] - pressure[idC(x, y, z - 1)]) * hInv;
+                    }
                 }
             }
         }
@@ -890,7 +1082,7 @@ static void buildMVP(float* m, float& cx, float& cy, float& cz, float azimuth, f
 
 int main() {
     if (!glfwInit()) return 1;
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     GLFWwindow* window = glfwCreateWindow(960, 960, "vapor", nullptr, nullptr);
     if (!window) return 1;
@@ -998,6 +1190,7 @@ int main() {
         if (ImGui::Button(paused ? "Resume" : "Pause")) paused = !paused;
         ImGui::SameLine();
         if (ImGui::Button("Reset")) {
+            sim.gpuSolver.shutdown();
             sim = SmokeSim3D(sim.n);
             prevBoxSize = sim.boxSize;
             renderer.setBoxSize(sim.boxSize);
@@ -1007,6 +1200,7 @@ int main() {
         ImGui::Checkbox("MC smoke", &sim.macCormackSmoke);
         ImGui::Checkbox("MC vel", &sim.macCormackVel);
         ImGui::Checkbox("Debug print", &debugPrintOn);
+        ImGui::Checkbox("GPU SOR", &sim.gpuSolver.enabled);
         ImGui::SliderFloat("Buoyancy", &buoyancy, 0.f, 10.f);
         ImGui::SliderFloat("Source", &sourceStrength, 0.f, 3.f);
         ImGui::SliderFloat("Smoke decay", &sim.smokeDecay, 0.f, 2.f);
@@ -1050,6 +1244,7 @@ int main() {
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+    sim.gpuSolver.shutdown();
     renderer.shutdown();
     glfwDestroyWindow(window);
     glfwTerminate();

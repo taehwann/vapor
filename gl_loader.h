@@ -9,6 +9,7 @@
 // header supplied by Windows.
 using GLchar = char;
 using GLsizeiptr = std::ptrdiff_t;
+using GLintptr = std::ptrdiff_t;
 
 #ifndef GL_ARRAY_BUFFER
 #define GL_ARRAY_BUFFER 0x8892
@@ -24,9 +25,13 @@ using GLsizeiptr = std::ptrdiff_t;
 #define GL_COLOR_ATTACHMENT0 0x8CE0
 #define GL_VERTEX_SHADER 0x8B31
 #define GL_FRAGMENT_SHADER 0x8B30
+#define GL_COMPUTE_SHADER 0x91B9
 #define GL_COMPILE_STATUS 0x8B81
 #define GL_LINK_STATUS 0x8B82
 #define GL_FALSE 0
+#define GL_SHADER_STORAGE_BUFFER 0x90D2
+#define GL_SHADER_STORAGE_BARRIER_BIT 0x2000
+#define GL_DYNAMIC_DRAW 0x88E8
 #endif
 
 #define VAPOR_GL_FUNCTIONS(X) \
@@ -63,7 +68,12 @@ using GLsizeiptr = std::ptrdiff_t;
     X(void, glUniform1f, (GLint, GLfloat)) \
     X(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
     X(void, glActiveTexture, (GLenum)) \
-    X(void, glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*))
+    X(void, glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*)) \
+    X(void, glDispatchCompute, (GLuint, GLuint, GLuint)) \
+    X(void, glBindBufferBase, (GLenum, GLuint, GLuint)) \
+    X(void, glMemoryBarrier, (GLbitfield)) \
+    X(void, glBufferSubData, (GLenum, GLintptr, GLsizeiptr, const void*)) \
+    X(void, glGetBufferSubData, (GLenum, GLintptr, GLsizeiptr, void*))
 
 #define VAPOR_DECLARE_GL_FUNCTION(return_type, name, arguments) \
     using name##Proc = return_type(APIENTRY*) arguments; \
