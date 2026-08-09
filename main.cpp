@@ -39,9 +39,12 @@ static GLuint compileComputeShader(const char* src) {
 
 struct GpuSORSolver {
     GLuint progDiv = 0, progRBGS = 0, progCorrect = 0;
+    GLuint progAdvectSL = 0, progAdvectMC = 0, progCopy = 0;
     GLuint ssboP = 0, ssboDiv = 0, ssboVx = 0, ssboVy = 0, ssboVz = 0;
+    GLuint ssboSmoke = 0, ssboFwd = 0, ssboAdvectSrc = 0, ssboAdvectOut = 0;
     int n = 0, vxSz = 0, vySz = 0, vzSz = 0;
-    bool enabled = false;
+    int maxSz = 0;
+    bool enabled = false, advectionEnabled = false;
 
     void init(int res, int vxSize, int vySize, int vzSize) {
         n = res; vxSz = vxSize; vySz = vySize; vzSz = vzSize;
@@ -109,6 +112,339 @@ void main() {
         progRBGS = compileComputeShader(rbgsSrc);
         progCorrect = compileComputeShader(correctSrc);
 
+        const char* advectSlSrc = R"glsl(#version 430 core
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+layout(std430, binding = 0) buffer VxBuf { float vx[]; };
+layout(std430, binding = 1) buffer VyBuf { float vy[]; };
+layout(std430, binding = 2) buffer VzBuf { float vz[]; };
+layout(std430, binding = 3) buffer SrcBuf { float src[]; };
+layout(std430, binding = 4) buffer FwdBuf { float fwd[]; };
+uniform int u_n, u_mode; uniform float u_dx, u_dt;
+int idC(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+int idX(int x, int y, int z) { return x + (u_n + 1) * (y + u_n * z); }
+int idY(int x, int y, int z) { return x + u_n * (y + (u_n + 1) * z); }
+int idZ(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+vec3 velocity(vec3 p) {
+    float gx = clamp(p.x / u_dx, 0.0f, float(u_n));
+    float gy = clamp(p.y / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    float gz = clamp(p.z / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    int x0 = min(int(gx), u_n - 1), y0 = int(gy), z0 = int(gz);
+    int x1 = x0 + 1, y1 = min(y0 + 1, u_n - 1), z1 = min(z0 + 1, u_n - 1);
+    float tx = gx - float(x0), ty = gy - float(y0), tz = gz - float(z0);
+    float vxVal = vx[idX(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vx[idX(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vx[idX(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vx[idX(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vx[idX(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vx[idX(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vx[idX(x0,y1,z1)]*(1-tx)*ty*tz + vx[idX(x1,y1,z1)]*tx*ty*tz;
+    gx = clamp(p.x / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    gy = clamp(p.y / u_dx, 0.0f, float(u_n));
+    x0 = int(gx); y0 = min(int(gy), u_n - 1); z0 = int(gz);
+    x1 = min(x0 + 1, u_n - 1); y1 = y0 + 1; z1 = min(z0 + 1, u_n - 1);
+    tx = gx - float(x0); ty = gy - float(y0);
+    float vyVal = vy[idY(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vy[idY(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vy[idY(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vy[idY(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vy[idY(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vy[idY(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vy[idY(x0,y1,z1)]*(1-tx)*ty*tz + vy[idY(x1,y1,z1)]*tx*ty*tz;
+    gy = clamp(p.y / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    gz = clamp(p.z / u_dx, 0.0f, float(u_n));
+    y0 = int(gy); z0 = min(int(gz), u_n - 1);
+    y1 = min(y0 + 1, u_n - 1); z1 = z0 + 1;
+    tx = gx - float(x0); ty = gy - float(y0); tz = gz - float(z0);
+    float vzVal = vz[idZ(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vz[idZ(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vz[idZ(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vz[idZ(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vz[idZ(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vz[idZ(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vz[idZ(x0,y1,z1)]*(1-tx)*ty*tz + vz[idZ(x1,y1,z1)]*tx*ty*tz;
+    return vec3(vxVal, vyVal, vzVal);
+}
+float sampleSrc(vec3 p) {
+    float dx = u_dx; int n = u_n;
+    if (u_mode == 0) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=int(gy), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idC(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idC(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idC(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idC(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idC(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idC(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idC(x0,y1,z1)]*(1-tx)*ty*tz+src[idC(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 1) {
+        float gx = clamp(p.x/dx, 0.0f, float(n));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=min(int(gx),n-1), y0=int(gy), z0=int(gz);
+        int x1=x0+1, y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idX(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idX(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idX(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idX(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idX(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idX(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idX(x0,y1,z1)]*(1-tx)*ty*tz+src[idX(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 2) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx, 0.0f, float(n));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=min(int(gy),n-1), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=y0+1, z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idY(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idY(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idY(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idY(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idY(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idY(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idY(x0,y1,z1)]*(1-tx)*ty*tz+src[idY(x1,y1,z1)]*tx*ty*tz;
+    } else {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx, 0.0f, float(n));
+        int x0=int(gx), y0=int(gy), z0=min(int(gz),n-1);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=z0+1;
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idZ(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idZ(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idZ(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idZ(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idZ(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idZ(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idZ(x0,y1,z1)]*(1-tx)*ty*tz+src[idZ(x1,y1,z1)]*tx*ty*tz;
+    }
+}
+int srcIdx(int i) { if (u_mode == 1) return i; if (u_mode == 2) return i; return i; }
+vec3 facePos(int x, int y, int z) {
+    float dx = u_dx;
+    if (u_mode == 0) return vec3((x+0.5f)*dx, (y+0.5f)*dx, (z+0.5f)*dx);
+    if (u_mode == 1) return vec3(float(x)*dx, (y+0.5f)*dx, (z+0.5f)*dx);
+    if (u_mode == 2) return vec3((x+0.5f)*dx, float(y)*dx, (z+0.5f)*dx);
+    return vec3((x+0.5f)*dx, (y+0.5f)*dx, float(z)*dx);
+}
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), z = int(gl_GlobalInvocationID.z);
+    if (u_mode == 0 && (x >= u_n || y >= u_n || z >= u_n)) return;
+    if (u_mode == 1 && (x > u_n || y >= u_n || z >= u_n)) return;
+    if (u_mode == 2 && (x >= u_n || y > u_n || z >= u_n)) return;
+    if (u_mode == 3 && (x >= u_n || y >= u_n || z > u_n)) return;
+    vec3 face = facePos(x, y, z);
+    vec3 v = velocity(face);
+    int i = (u_mode == 0) ? idC(x,y,z) : (u_mode == 1) ? idX(x,y,z) : (u_mode == 2) ? idY(x,y,z) : idZ(x,y,z);
+    fwd[i] = sampleSrc(face - v * u_dt);
+}
+)glsl";
+
+        const char* advectMcSrc = R"glsl(#version 430 core
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+layout(std430, binding = 0) buffer VxBuf { float vx[]; };
+layout(std430, binding = 1) buffer VyBuf { float vy[]; };
+layout(std430, binding = 2) buffer VzBuf { float vz[]; };
+layout(std430, binding = 3) buffer SrcBuf { float src[]; };
+layout(std430, binding = 4) buffer FwdBuf { float fwd[]; };
+layout(std430, binding = 5) buffer OutBuf { float outBuf[]; };
+uniform int u_n, u_mode; uniform float u_dx, u_dt, u_boxSize, u_cflMc;
+int idC(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+int idX(int x, int y, int z) { return x + (u_n + 1) * (y + u_n * z); }
+int idY(int x, int y, int z) { return x + u_n * (y + (u_n + 1) * z); }
+int idZ(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+vec3 velocity(vec3 p) {
+    float gx = clamp(p.x / u_dx, 0.0f, float(u_n));
+    float gy = clamp(p.y / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    float gz = clamp(p.z / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    int x0 = min(int(gx), u_n - 1), y0 = int(gy), z0 = int(gz);
+    int x1 = x0 + 1, y1 = min(y0 + 1, u_n - 1), z1 = min(z0 + 1, u_n - 1);
+    float tx = gx - float(x0), ty = gy - float(y0), tz = gz - float(z0);
+    float vxVal = vx[idX(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vx[idX(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vx[idX(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vx[idX(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vx[idX(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vx[idX(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vx[idX(x0,y1,z1)]*(1-tx)*ty*tz + vx[idX(x1,y1,z1)]*tx*ty*tz;
+    gx = clamp(p.x / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    gy = clamp(p.y / u_dx, 0.0f, float(u_n));
+    x0 = int(gx); y0 = min(int(gy), u_n - 1); z0 = int(gz);
+    x1 = min(x0 + 1, u_n - 1); y1 = y0 + 1; z1 = min(z0 + 1, u_n - 1);
+    tx = gx - float(x0); ty = gy - float(y0);
+    float vyVal = vy[idY(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vy[idY(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vy[idY(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vy[idY(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vy[idY(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vy[idY(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vy[idY(x0,y1,z1)]*(1-tx)*ty*tz + vy[idY(x1,y1,z1)]*tx*ty*tz;
+    gy = clamp(p.y / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    gz = clamp(p.z / u_dx, 0.0f, float(u_n));
+    y0 = int(gy); z0 = min(int(gz), u_n - 1);
+    y1 = min(y0 + 1, u_n - 1); z1 = z0 + 1;
+    tx = gx - float(x0); ty = gy - float(y0); tz = gz - float(z0);
+    float vzVal = vz[idZ(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vz[idZ(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vz[idZ(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vz[idZ(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vz[idZ(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vz[idZ(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vz[idZ(x0,y1,z1)]*(1-tx)*ty*tz + vz[idZ(x1,y1,z1)]*tx*ty*tz;
+    return vec3(vxVal, vyVal, vzVal);
+}
+float sampleSrc(vec3 p) {
+    float dx = u_dx; int n = u_n;
+    if (u_mode == 0) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=int(gy), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idC(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idC(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idC(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idC(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idC(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idC(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idC(x0,y1,z1)]*(1-tx)*ty*tz+src[idC(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 1) {
+        float gx = clamp(p.x/dx, 0.0f, float(n));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=min(int(gx),n-1), y0=int(gy), z0=int(gz);
+        int x1=x0+1, y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idX(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idX(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idX(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idX(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idX(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idX(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idX(x0,y1,z1)]*(1-tx)*ty*tz+src[idX(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 2) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx, 0.0f, float(n));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=min(int(gy),n-1), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=y0+1, z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idY(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idY(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idY(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idY(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idY(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idY(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idY(x0,y1,z1)]*(1-tx)*ty*tz+src[idY(x1,y1,z1)]*tx*ty*tz;
+    } else {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx, 0.0f, float(n));
+        int x0=int(gx), y0=int(gy), z0=min(int(gz),n-1);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=z0+1;
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idZ(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idZ(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idZ(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idZ(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idZ(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idZ(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idZ(x0,y1,z1)]*(1-tx)*ty*tz+src[idZ(x1,y1,z1)]*tx*ty*tz;
+    }
+}
+float sampleFwdBuf(vec3 p) {
+    float dx = u_dx; int n = u_n;
+    if (u_mode == 0) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=int(gy), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return fwd[idC(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+fwd[idC(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               fwd[idC(x0,y1,z0)]*(1-tx)*ty*(1-tz)+fwd[idC(x1,y1,z0)]*tx*ty*(1-tz)+
+               fwd[idC(x0,y0,z1)]*(1-tx)*(1-ty)*tz+fwd[idC(x1,y0,z1)]*tx*(1-ty)*tz+
+               fwd[idC(x0,y1,z1)]*(1-tx)*ty*tz+fwd[idC(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 1) {
+        float gx = clamp(p.x/dx, 0.0f, float(n));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=min(int(gx),n-1), y0=int(gy), z0=int(gz);
+        int x1=x0+1, y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return fwd[idX(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+fwd[idX(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               fwd[idX(x0,y1,z0)]*(1-tx)*ty*(1-tz)+fwd[idX(x1,y1,z0)]*tx*ty*(1-tz)+
+               fwd[idX(x0,y0,z1)]*(1-tx)*(1-ty)*tz+fwd[idX(x1,y0,z1)]*tx*(1-ty)*tz+
+               fwd[idX(x0,y1,z1)]*(1-tx)*ty*tz+fwd[idX(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 2) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx, 0.0f, float(n));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=min(int(gy),n-1), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=y0+1, z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return fwd[idY(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+fwd[idY(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               fwd[idY(x0,y1,z0)]*(1-tx)*ty*(1-tz)+fwd[idY(x1,y1,z0)]*tx*ty*(1-tz)+
+               fwd[idY(x0,y0,z1)]*(1-tx)*(1-ty)*tz+fwd[idY(x1,y0,z1)]*tx*(1-ty)*tz+
+               fwd[idY(x0,y1,z1)]*(1-tx)*ty*tz+fwd[idY(x1,y1,z1)]*tx*ty*tz;
+    } else {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx, 0.0f, float(n));
+        int x0=int(gx), y0=int(gy), z0=min(int(gz),n-1);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=z0+1;
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return fwd[idZ(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+fwd[idZ(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               fwd[idZ(x0,y1,z0)]*(1-tx)*ty*(1-tz)+fwd[idZ(x1,y1,z0)]*tx*ty*(1-tz)+
+               fwd[idZ(x0,y0,z1)]*(1-tx)*(1-ty)*tz+fwd[idZ(x1,y0,z1)]*tx*(1-ty)*tz+
+               fwd[idZ(x0,y1,z1)]*(1-tx)*ty*tz+fwd[idZ(x1,y1,z1)]*tx*ty*tz;
+    }
+}
+vec3 facePos(int x, int y, int z) {
+    float dx = u_dx;
+    if (u_mode == 0) return vec3((x+0.5f)*dx, (y+0.5f)*dx, (z+0.5f)*dx);
+    if (u_mode == 1) return vec3(float(x)*dx, (y+0.5f)*dx, (z+0.5f)*dx);
+    if (u_mode == 2) return vec3((x+0.5f)*dx, float(y)*dx, (z+0.5f)*dx);
+    return vec3((x+0.5f)*dx, (y+0.5f)*dx, float(z)*dx);
+}
+int clampX(int v) { return (u_mode == 1) ? clamp(v, 0, u_n) : clamp(v, 0, u_n - 1); }
+int clampY(int v) { return (u_mode == 2) ? clamp(v, 0, u_n) : clamp(v, 0, u_n - 1); }
+int clampZ(int v) { return (u_mode == 3) ? clamp(v, 0, u_n) : clamp(v, 0, u_n - 1); }
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), z = int(gl_GlobalInvocationID.z);
+    if (u_mode == 0 && (x >= u_n || y >= u_n || z >= u_n)) return;
+    if (u_mode == 1 && (x > u_n || y >= u_n || z >= u_n)) return;
+    if (u_mode == 2 && (x >= u_n || y > u_n || z >= u_n)) return;
+    if (u_mode == 3 && (x >= u_n || y >= u_n || z > u_n)) return;
+    int i = (u_mode == 0) ? idC(x,y,z) : (u_mode == 1) ? idX(x,y,z) : (u_mode == 2) ? idY(x,y,z) : idZ(x,y,z);
+    vec3 face = facePos(x, y, z);
+    vec3 v = velocity(face);
+    vec3 posFwd = face - v * u_dt;
+    if (posFwd.x < 0.0f || posFwd.x > u_boxSize || posFwd.y < 0.0f || posFwd.y > u_boxSize || posFwd.z < 0.0f || posFwd.z > u_boxSize ||
+        face.x + v.x * u_dt < 0.0f || face.x + v.x * u_dt > u_boxSize ||
+        face.y + v.y * u_dt < 0.0f || face.y + v.y * u_dt > u_boxSize ||
+        face.z + v.z * u_dt < 0.0f || face.z + v.z * u_dt > u_boxSize ||
+        length(v) * u_dt / u_dx > u_cflMc) {
+        outBuf[i] = fwd[i];
+        return;
+    }
+    float backVal = sampleFwdBuf(face + v * u_dt);
+    float corrected = fwd[i] + 0.5f * (src[i] - backVal);
+    int gx, gy, gz;
+    float dx = u_dx;
+    if (u_mode == 0) {
+        gx = clamp(int(posFwd.x/dx-0.5f), 0, u_n-1);
+        gy = clamp(int(posFwd.y/dx-0.5f), 0, u_n-1);
+        gz = clamp(int(posFwd.z/dx-0.5f), 0, u_n-1);
+    } else if (u_mode == 1) {
+        gx = clamp(int(posFwd.x/dx), 0, u_n);
+        gy = clamp(int(posFwd.y/dx-0.5f), 0, u_n-1);
+        gz = clamp(int(posFwd.z/dx-0.5f), 0, u_n-1);
+    } else if (u_mode == 2) {
+        gx = clamp(int(posFwd.x/dx-0.5f), 0, u_n-1);
+        gy = clamp(int(posFwd.y/dx), 0, u_n);
+        gz = clamp(int(posFwd.z/dx-0.5f), 0, u_n-1);
+    } else {
+        gx = clamp(int(posFwd.x/dx-0.5f), 0, u_n-1);
+        gy = clamp(int(posFwd.y/dx-0.5f), 0, u_n-1);
+        gz = clamp(int(posFwd.z/dx), 0, u_n);
+    }
+    float fMin = src[i], fMax = fMin;
+    for (int dz = 0; dz <= 1; ++dz) {
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx2 = 0; dx2 <= 1; ++dx2) {
+                int nx = clampX(gx + dx2), ny = clampY(gy + dy), nz = clampZ(gz + dz);
+                int ni = (u_mode == 0) ? idC(nx,ny,nz) : (u_mode == 1) ? idX(nx,ny,nz) : (u_mode == 2) ? idY(nx,ny,nz) : idZ(nx,ny,nz);
+                float val = src[ni];
+                fMin = min(fMin, val);
+                fMax = max(fMax, val);
+            }
+        }
+    }
+    outBuf[i] = clamp(corrected, fMin, fMax);
+}
+)glsl";
+
+        const char* copySrc = R"glsl(#version 430 core
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) buffer SrcBuf { float src[]; };
+layout(std430, binding = 1) buffer DstBuf { float dst[]; };
+uniform int u_count;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= u_count) return;
+    dst[i] = src[i];
+}
+)glsl";
+
+        progAdvectSL = compileComputeShader(advectSlSrc);
+        progAdvectMC = compileComputeShader(advectMcSrc);
+        progCopy = compileComputeShader(copySrc);
+
         auto newSSBO = [](GLuint& handle, int count) {
             glGenBuffers(1, &handle);
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, handle);
@@ -120,6 +456,12 @@ void main() {
         newSSBO(ssboVx, vxSz);
         newSSBO(ssboVy, vySz);
         newSSBO(ssboVz, vzSz);
+
+        maxSz = std::max({ vxSz, vySz, vzSz, n * n * n });
+        newSSBO(ssboSmoke, n * n * n);
+        newSSBO(ssboFwd, maxSz);
+        newSSBO(ssboAdvectSrc, maxSz);
+        newSSBO(ssboAdvectOut, maxSz);
 
         enabled = true;
     }
@@ -195,15 +537,161 @@ void main() {
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vzSz * sizeof(float), vzOut);
     }
 
+    void uploadVelocity(const float* vxData, const float* vyData, const float* vzData) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVx);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vxSz * sizeof(float), vxData);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVy);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vySz * sizeof(float), vyData);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboVz);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vzSz * sizeof(float), vzData);
+    }
+
+    void dispatchSL(int mode, int count, float dx, float dt) {
+        glUseProgram(progAdvectSL);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboVx);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboVy);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssboVz);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssboAdvectSrc);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssboFwd);
+        glUniform1i(glGetUniformLocation(progAdvectSL, "u_n"), n);
+        glUniform1i(glGetUniformLocation(progAdvectSL, "u_mode"), mode);
+        glUniform1f(glGetUniformLocation(progAdvectSL, "u_dx"), dx);
+        glUniform1f(glGetUniformLocation(progAdvectSL, "u_dt"), dt);
+        int gx = (n + 7) / 8, gy = (n + 7) / 8, gz = (n + 3) / 4;
+        if (mode == 1) gx = (n + 1 + 7) / 8;
+        else if (mode == 2) gy = (n + 1 + 7) / 8;
+        else if (mode == 3) gz = (n + 1 + 3) / 4;
+        glDispatchCompute(gx, gy, gz);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+
+    void dispatchMC(int mode, float dx, float dt, float boxSize, float cflMc, GLuint srcBo, GLuint outBo) {
+        glUseProgram(progAdvectMC);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboVx);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboVy);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssboVz);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, srcBo);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssboFwd);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, outBo);
+        glUniform1i(glGetUniformLocation(progAdvectMC, "u_n"), n);
+        glUniform1i(glGetUniformLocation(progAdvectMC, "u_mode"), mode);
+        glUniform1f(glGetUniformLocation(progAdvectMC, "u_dx"), dx);
+        glUniform1f(glGetUniformLocation(progAdvectMC, "u_dt"), dt);
+        glUniform1f(glGetUniformLocation(progAdvectMC, "u_boxSize"), boxSize);
+        glUniform1f(glGetUniformLocation(progAdvectMC, "u_cflMc"), cflMc);
+        int gx = (n + 7) / 8, gy = (n + 7) / 8, gz = (n + 3) / 4;
+        if (mode == 1) gx = (n + 1 + 7) / 8;
+        else if (mode == 2) gy = (n + 1 + 7) / 8;
+        else if (mode == 3) gz = (n + 1 + 3) / 4;
+        glDispatchCompute(gx, gy, gz);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+
+    void copySSBO(GLuint dstBo, GLuint srcBo, int count) {
+        glUseProgram(progCopy);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, srcBo);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dstBo);
+        glUniform1i(glGetUniformLocation(progCopy, "u_count"), count);
+        glDispatchCompute((count + 63) / 64, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+
+    void advectSmokeGPU(float dt, float* smokeData, const float* vxVel, const float* vyVel, const float* vzVel, float boxSize, float cflMc, bool useMC) {
+        const float dx = boxSize / n;
+        const int N = n * n * n;
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboSmoke);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)N * sizeof(float), smokeData);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectSrc);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)N * sizeof(float), smokeData);
+        uploadVelocity(vxVel, vyVel, vzVel);
+
+        dispatchSL(0, N, dx, dt);
+
+        if (!useMC) {
+            copySSBO(ssboSmoke, ssboFwd, N);
+        } else {
+            dispatchMC(0, dx, dt, boxSize, cflMc, ssboSmoke, ssboAdvectOut);
+            copySSBO(ssboSmoke, ssboAdvectOut, N);
+        }
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboSmoke);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)N * sizeof(float), smokeData);
+    }
+
+    void advectVxGPU(float dt, const float* vxSrc, int srcSz, const float* vxVel, const float* vyVel, const float* vzVel, float* vxOut, float boxSize, float cflMc, bool useMC) {
+        const float dx = boxSize / n;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectSrc);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)srcSz * sizeof(float), vxSrc);
+        uploadVelocity(vxVel, vyVel, vzVel);
+
+        dispatchSL(1, srcSz, dx, dt);
+
+        if (!useMC) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectOut);
+            copySSBO(ssboAdvectOut, ssboFwd, srcSz);
+        } else {
+            dispatchMC(1, dx, dt, boxSize, cflMc, ssboAdvectSrc, ssboAdvectOut);
+        }
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectOut);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)srcSz * sizeof(float), vxOut);
+    }
+
+    void advectVyGPU(float dt, const float* vySrc, int srcSz, const float* vxVel, const float* vyVel, const float* vzVel, float* vyOut, float boxSize, float cflMc, bool useMC) {
+        const float dx = boxSize / n;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectSrc);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)srcSz * sizeof(float), vySrc);
+        uploadVelocity(vxVel, vyVel, vzVel);
+
+        dispatchSL(2, srcSz, dx, dt);
+
+        if (!useMC) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectOut);
+            copySSBO(ssboAdvectOut, ssboFwd, srcSz);
+        } else {
+            dispatchMC(2, dx, dt, boxSize, cflMc, ssboAdvectSrc, ssboAdvectOut);
+        }
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectOut);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)srcSz * sizeof(float), vyOut);
+    }
+
+    void advectVzGPU(float dt, const float* vzSrc, int srcSz, const float* vxVel, const float* vyVel, const float* vzVel, float* vzOut, float boxSize, float cflMc, bool useMC) {
+        const float dx = boxSize / n;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectSrc);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)srcSz * sizeof(float), vzSrc);
+        uploadVelocity(vxVel, vyVel, vzVel);
+
+        dispatchSL(3, srcSz, dx, dt);
+
+        if (!useMC) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectOut);
+            copySSBO(ssboAdvectOut, ssboFwd, srcSz);
+        } else {
+            dispatchMC(3, dx, dt, boxSize, cflMc, ssboAdvectSrc, ssboAdvectOut);
+        }
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboAdvectOut);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)srcSz * sizeof(float), vzOut);
+    }
+
     void shutdown() {
         if (progDiv) glDeleteProgram(progDiv);
         if (progRBGS) glDeleteProgram(progRBGS);
         if (progCorrect) glDeleteProgram(progCorrect);
+        if (progAdvectSL) glDeleteProgram(progAdvectSL);
+        if (progAdvectMC) glDeleteProgram(progAdvectMC);
+        if (progCopy) glDeleteProgram(progCopy);
         if (ssboP) glDeleteBuffers(1, &ssboP);
         if (ssboDiv) glDeleteBuffers(1, &ssboDiv);
         if (ssboVx) glDeleteBuffers(1, &ssboVx);
         if (ssboVy) glDeleteBuffers(1, &ssboVy);
         if (ssboVz) glDeleteBuffers(1, &ssboVz);
+        if (ssboSmoke) glDeleteBuffers(1, &ssboSmoke);
+        if (ssboFwd) glDeleteBuffers(1, &ssboFwd);
+        if (ssboAdvectSrc) glDeleteBuffers(1, &ssboAdvectSrc);
+        if (ssboAdvectOut) glDeleteBuffers(1, &ssboAdvectOut);
     }
 };
 
@@ -783,14 +1271,21 @@ struct SmokeSim3D {
 
         vx0 = vx; vy0 = vy; vz0 = vz;
 
-        advectVx(halfDt, vx0, vx0, vy0, vz0, vx);
-        vxTilde = vx;
-
-        advectVy(halfDt, vy0, vx0, vy0, vz0, vy);
-        vyTilde = vy;
-
-        advectVz(halfDt, vz0, vx0, vy0, vz0, vz);
-        vzTilde = vz;
+        if (gpuSolver.advectionEnabled) {
+            gpuSolver.advectVxGPU(halfDt, vx0.data(), gpuSolver.vxSz, vx0.data(), vy0.data(), vz0.data(), vx.data(), boxSize, cflMc, macCormackVel);
+            vxTilde = vx;
+            gpuSolver.advectVyGPU(halfDt, vy0.data(), gpuSolver.vySz, vx0.data(), vy0.data(), vz0.data(), vy.data(), boxSize, cflMc, macCormackVel);
+            vyTilde = vy;
+            gpuSolver.advectVzGPU(halfDt, vz0.data(), gpuSolver.vzSz, vx0.data(), vy0.data(), vz0.data(), vz.data(), boxSize, cflMc, macCormackVel);
+            vzTilde = vz;
+        } else {
+            advectVx(halfDt, vx0, vx0, vy0, vz0, vx);
+            vxTilde = vx;
+            advectVy(halfDt, vy0, vx0, vy0, vz0, vy);
+            vyTilde = vy;
+            advectVz(halfDt, vz0, vx0, vy0, vz0, vz);
+            vzTilde = vz;
+        }
 
         project(halfDt, halfIters);
 
@@ -803,13 +1298,24 @@ struct SmokeSim3D {
 #pragma omp parallel for
         for (int i = 0; i < (int)vz.size(); ++i) vzHat[i] = 2.f * vz[i] - vzTilde[i];
 
-        advectVx(halfDt, vxHat, vxDiv0, vyDiv0, vzDiv0, vx, macCormackVel);
-        advectVy(halfDt, vyHat, vxDiv0, vyDiv0, vzDiv0, vy, macCormackVel);
-        advectVz(halfDt, vzHat, vxDiv0, vyDiv0, vzDiv0, vz, macCormackVel);
+        if (gpuSolver.advectionEnabled) {
+            gpuSolver.advectVxGPU(halfDt, vxHat.data(), gpuSolver.vxSz, vxDiv0.data(), vyDiv0.data(), vzDiv0.data(), vx.data(), boxSize, cflMc, macCormackVel);
+            gpuSolver.advectVyGPU(halfDt, vyHat.data(), gpuSolver.vySz, vxDiv0.data(), vyDiv0.data(), vzDiv0.data(), vy.data(), boxSize, cflMc, macCormackVel);
+            gpuSolver.advectVzGPU(halfDt, vzHat.data(), gpuSolver.vzSz, vxDiv0.data(), vyDiv0.data(), vzDiv0.data(), vz.data(), boxSize, cflMc, macCormackVel);
+        } else {
+            advectVx(halfDt, vxHat, vxDiv0, vyDiv0, vzDiv0, vx, macCormackVel);
+            advectVy(halfDt, vyHat, vxDiv0, vyDiv0, vzDiv0, vy, macCormackVel);
+            advectVz(halfDt, vzHat, vxDiv0, vyDiv0, vzDiv0, vz, macCormackVel);
+        }
 
         project(halfDt, halfIters);
 
-        advectScalar(smoke, dt);
+        if (gpuSolver.advectionEnabled) {
+            const int N = n * n * n;
+            gpuSolver.advectSmokeGPU(dt, smoke.data(), vx.data(), vy.data(), vz.data(), boxSize, cflMc, macCormackSmoke);
+        } else {
+            advectScalar(smoke, dt);
+        }
         applyDissipation(dt);
     }
 
@@ -819,12 +1325,25 @@ struct SmokeSim3D {
         enforceVelocityBoundaries();
 
         vx0 = vx; vy0 = vy; vz0 = vz;
-        advectVx(dt, vx0, vx0, vy0, vz0, vx);
-        advectVy(dt, vy0, vx0, vy0, vz0, vy);
-        advectVz(dt, vz0, vx0, vy0, vz0, vz);
+
+        if (gpuSolver.advectionEnabled) {
+            gpuSolver.advectVxGPU(dt, vx0.data(), gpuSolver.vxSz, vx0.data(), vy0.data(), vz0.data(), vx.data(), boxSize, cflMc, macCormackVel);
+            gpuSolver.advectVyGPU(dt, vy0.data(), gpuSolver.vySz, vx0.data(), vy0.data(), vz0.data(), vy.data(), boxSize, cflMc, macCormackVel);
+            gpuSolver.advectVzGPU(dt, vz0.data(), gpuSolver.vzSz, vx0.data(), vy0.data(), vz0.data(), vz.data(), boxSize, cflMc, macCormackVel);
+        } else {
+            advectVx(dt, vx0, vx0, vy0, vz0, vx);
+            advectVy(dt, vy0, vx0, vy0, vz0, vy);
+            advectVz(dt, vz0, vx0, vy0, vz0, vz);
+        }
 
         project(dt, projectIterations);
-        advectScalar(smoke, dt);
+
+        if (gpuSolver.advectionEnabled) {
+            const int N = n * n * n;
+            gpuSolver.advectSmokeGPU(dt, smoke.data(), vx.data(), vy.data(), vz.data(), boxSize, cflMc, macCormackSmoke);
+        } else {
+            advectScalar(smoke, dt);
+        }
         applyDissipation(dt);
     }
 
@@ -867,12 +1386,30 @@ struct SmokeSim3D {
     void rebox(float oldSz, float newSz) {
         if (newSz == oldSz) return;
         boxSize = newSz;
+        resetState();
+    }
+
+    void resetState() {
         std::fill(smoke.begin(), smoke.end(), 0.f);
         std::fill(vx.begin(), vx.end(), 0.f);
         std::fill(vy.begin(), vy.end(), 0.f);
         std::fill(vz.begin(), vz.end(), 0.f);
         std::fill(pressure.begin(), pressure.end(), 0.f);
         std::fill(divergence.begin(), divergence.end(), 0.f);
+        std::fill(fwdScratch.begin(), fwdScratch.end(), 0.f);
+        std::fill(backScratch.begin(), backScratch.end(), 0.f);
+        std::fill(vx0.begin(), vx0.end(), 0.f);
+        std::fill(vy0.begin(), vy0.end(), 0.f);
+        std::fill(vz0.begin(), vz0.end(), 0.f);
+        std::fill(vxTilde.begin(), vxTilde.end(), 0.f);
+        std::fill(vyTilde.begin(), vyTilde.end(), 0.f);
+        std::fill(vzTilde.begin(), vzTilde.end(), 0.f);
+        std::fill(vxHat.begin(), vxHat.end(), 0.f);
+        std::fill(vyHat.begin(), vyHat.end(), 0.f);
+        std::fill(vzHat.begin(), vzHat.end(), 0.f);
+        std::fill(vxDiv0.begin(), vxDiv0.end(), 0.f);
+        std::fill(vyDiv0.begin(), vyDiv0.end(), 0.f);
+        std::fill(vzDiv0.begin(), vzDiv0.end(), 0.f);
     }
 };
 
@@ -1190,17 +1727,14 @@ int main() {
         if (ImGui::Button(paused ? "Resume" : "Pause")) paused = !paused;
         ImGui::SameLine();
         if (ImGui::Button("Reset")) {
-            sim.gpuSolver.shutdown();
-            sim = SmokeSim3D(sim.n);
-            prevBoxSize = sim.boxSize;
-            renderer.setBoxSize(sim.boxSize);
-            dist = sim.boxSize * 2.5f;
+            sim.resetState();
         }
         ImGui::Checkbox("Reflection", &useReflection);
         ImGui::Checkbox("MC smoke", &sim.macCormackSmoke);
         ImGui::Checkbox("MC vel", &sim.macCormackVel);
         ImGui::Checkbox("Debug print", &debugPrintOn);
         ImGui::Checkbox("GPU SOR", &sim.gpuSolver.enabled);
+        ImGui::Checkbox("GPU Advection", &sim.gpuSolver.advectionEnabled);
         ImGui::SliderFloat("Buoyancy", &buoyancy, 0.f, 10.f);
         ImGui::SliderFloat("Source", &sourceStrength, 0.f, 3.f);
         ImGui::SliderFloat("Smoke decay", &sim.smokeDecay, 0.f, 2.f);

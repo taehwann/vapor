@@ -4,8 +4,9 @@ An interactive **3D smoke-plume** simulation written in C++20, rendered with Ope
 4.3 volume ray-marching and Dear ImGui. The solver integrates the incompressible
 Navier–Stokes equations on a **closed-box** staggered (MAC) grid using semi-Lagrangian
 advection, an optional midpoint-reflect (Richardson extrapolation) velocity update,
-and a red-black SOR pressure solve. The SOR solve can be toggled between CPU
-(OpenMP-parallelised) and GPU (OpenGL 4.3 compute shader) at runtime.
+and a red-black SOR pressure solve. Both the SOR solve and the semi-Lagrangian
+advection can be toggled between CPU (OpenMP-parallelised) and GPU (OpenGL 4.3
+compute shader) independently at runtime.
 
 ---
 
@@ -121,7 +122,7 @@ sFactor = clamp(1.0 - smokeDecay * dt, 0.0, 1.0)
 smoke[i] *= sFactor
 ```
 
-`smokeDecay = 0.85` by default (tuned so the plume fades before reaching the top
+`smokeDecay = 0.06` by default (tuned so the plume fades before reaching the top
 wall in a closed box). Adjustable 0–2 via UI slider.
 
 ---
@@ -178,6 +179,33 @@ Gauss-Seidel SOR** method. Two backends are available, toggleable via the
 |---------|-------------|
 | **CPU** (default) | OpenMP-parallelised red-black SOR, runs on host. Same algorithm as GPU. |
 | **GPU** | OpenGL 4.3 compute shaders with SSBOs. Divergence, SOR, and velocity correction run entirely on the GPU via `glDispatchCompute`. Data is uploaded before and downloaded after each `project()` call. |
+
+### GPU advection
+
+Semi-Lagrangian advection with optional MacCormack correction can also be offloaded
+to the GPU, toggleable via the "GPU Advection" checkbox:
+
+| Backend | Description |
+|---------|-------------|
+| **CPU** (default) | OpenMP-parallelised advection on host. All fields (`smoke`, `vx`, `vy`, `vz`) are advected in-place with scratch vectors. |
+| **GPU** | OpenGL 4.3 compute shaders with SSBOs. Two shader programs (`progAdvectSL` and `progAdvectMC`) handle all four field types (scalar smoke, x/y/z velocity faces) via a mode uniform. Each advection call uploads source and tracer velocity fields, dispatches one or two compute passes (semi-Lagrangian backtrace + optional MacCormack correction), and downloads the result. |
+
+The GPU advection reuses the same velocity SSBOs created for the GPU SOR solver
+and adds four additional buffers: `ssboSmoke`, `ssboFwd` (scratch for the
+semi-Lagrangian backtrace), `ssboAdvectSrc`, and `ssboAdvectOut`. A simple
+`progCopy` shader handles buffer-to-buffer copies when MacCormack is disabled.
+
+The GLSL implementations mirror the CPU advection logic exactly:
+- **Trilinear interpolation** for velocity sampling and field lookups, with the
+  same clamped coordinate ranges and staggered-grid index functions (`idC`, `idX`,
+  `idY`, `idZ`).
+- **MacCormack correction** with boundary fallback (out-of-domain traces revert to
+  pure semi-Lagrangian), CFL guard, and 2×2×2 neighbourhood clamping.
+- Workgroup size 8×8×4 per dispatch, matching the divergence shader layout.
+
+GPU advection and GPU SOR can be enabled independently. When both are active, the
+entire advection–projection pipeline runs on the GPU with upload/download per
+operation (future work: persistent GPU-resident fields to eliminate the round-trip).
 
 ### Divergence computation
 
@@ -347,15 +375,16 @@ Visual Studio 2022 builds with `MSBuild` are also supported (tested with
 | Control          | Default    | Range      | Description                                      |
 | ---------------- | ---------- | ---------- | ------------------------------------------------ |
 | Pause / Resume   | —          | —          | Freeze or advance the simulation                 |
-| Reset            | —          | —          | Clear all fields, keep parameters                |
+| Reset            | —          | —          | Zero all simulation fields, keep all parameters  |
 | Reflection       | true       | bool       | Toggle second-order midpoint-reflect vs single-pass |
 | MC smoke         | true       | bool       | Toggle MacCormack correction for smoke advection |
 | MC vel           | true       | bool       | Toggle MacCormack correction for velocity        |
 | Debug print      | true       | bool       | Log diagnostic stats and ASCII framebuffer       |
 | GPU SOR          | false      | bool       | Run SOR pressure solve on GPU via compute shaders|
+| GPU Advection    | false      | bool       | Run semi-Lagrangian advection on GPU via compute shaders |
 | Buoyancy         | 2.5        | 0–10       | Upward force strength                            |
 | Source           | 1.0        | 0–3        | Emitter injection multiplier                     |
-| Smoke decay      | 0.85       | 0–2        | Per-frame density dissipation rate               |
+| Smoke decay      | 0.06       | 0–2        | Per-frame density dissipation rate               |
 | Box size         | 4.5        | 0.5–8      | Domain extent `[0, boxSize]³`                    |
 | Emitt radius     | 0.035      | 0.01–0.2   | Emitter sphere radius (normalised [0,1])         |
 | Stir             | 0.5        | 0–2        | Random turbulence jitter in emitter              |
@@ -385,7 +414,7 @@ Every 5 frames, an 80×24 ASCII frame dump is appended.
 
 | File            | Purpose                                             |
 | --------------- | --------------------------------------------------- |
-| `main.cpp`      | `SmokeSim3D` (solver), `GpuSORSolver`, `VolumeRenderer`, UI loop |
+| `main.cpp`      | `SmokeSim3D` (solver), `GpuSORSolver` (GPU pressure + advection), `VolumeRenderer`, UI loop |
 | `gl_loader.h`   | Loads OpenGL 4.3 entry points at runtime (compute shader support) |
 | `dependency/`   | GLFW and Dear ImGui submodules                      |
 | `build/`        | CMake build output                                  |
