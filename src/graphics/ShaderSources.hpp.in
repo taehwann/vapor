@@ -1,0 +1,23 @@
+#pragma once
+
+// Generated at configure time from the standalone GLSL files.
+namespace ShaderSources {
+inline constexpr char divSrc[] = R"glsl(@divSrc@)glsl";
+
+inline constexpr char rbgsSrc[] = R"glsl(@rbgsSrc@)glsl";
+
+inline constexpr char correctSrc[] = R"glsl(@correctSrc@)glsl";
+
+inline constexpr char advectSlSrc[] = R"glsl(@advectSlSrc@)glsl";
+
+inline constexpr char advectMcSrc[] = R"glsl(@advectMcSrc@)glsl";
+
+inline constexpr char copySrc[] = R"glsl(@copySrc@)glsl";
+
+inline constexpr char vert[] = R"glsl(@vert@)glsl";
+
+inline constexpr char frag[] = R"glsl(@frag@)glsl";
+
+inline constexpr char imageVert[] = R"glsl(@imageVert@)glsl";
+inline constexpr char imageFrag[] = R"glsl(@imageFrag@)glsl";
+}

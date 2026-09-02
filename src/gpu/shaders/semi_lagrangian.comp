@@ -1,0 +1,110 @@
+#version 430 core
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+layout(std430, binding = 0) buffer VxBuf { float vx[]; };
+layout(std430, binding = 1) buffer VyBuf { float vy[]; };
+layout(std430, binding = 2) buffer VzBuf { float vz[]; };
+layout(std430, binding = 3) buffer SrcBuf { float src[]; };
+layout(std430, binding = 4) buffer FwdBuf { float fwd[]; };
+uniform int u_n, u_mode; uniform float u_dx, u_dt;
+int idC(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+int idX(int x, int y, int z) { return x + (u_n + 1) * (y + u_n * z); }
+int idY(int x, int y, int z) { return x + u_n * (y + (u_n + 1) * z); }
+int idZ(int x, int y, int z) { return x + u_n * (y + u_n * z); }
+vec3 velocity(vec3 p) {
+    float gx = clamp(p.x / u_dx, 0.0f, float(u_n));
+    float gy = clamp(p.y / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    float gz = clamp(p.z / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    int x0 = min(int(gx), u_n - 1), y0 = int(gy), z0 = int(gz);
+    int x1 = x0 + 1, y1 = min(y0 + 1, u_n - 1), z1 = min(z0 + 1, u_n - 1);
+    float tx = gx - float(x0), ty = gy - float(y0), tz = gz - float(z0);
+    float vxVal = vx[idX(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vx[idX(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vx[idX(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vx[idX(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vx[idX(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vx[idX(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vx[idX(x0,y1,z1)]*(1-tx)*ty*tz + vx[idX(x1,y1,z1)]*tx*ty*tz;
+    gx = clamp(p.x / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    gy = clamp(p.y / u_dx, 0.0f, float(u_n));
+    x0 = int(gx); y0 = min(int(gy), u_n - 1); z0 = int(gz);
+    x1 = min(x0 + 1, u_n - 1); y1 = y0 + 1; z1 = min(z0 + 1, u_n - 1);
+    tx = gx - float(x0); ty = gy - float(y0);
+    float vyVal = vy[idY(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vy[idY(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vy[idY(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vy[idY(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vy[idY(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vy[idY(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vy[idY(x0,y1,z1)]*(1-tx)*ty*tz + vy[idY(x1,y1,z1)]*tx*ty*tz;
+    gy = clamp(p.y / u_dx - 0.5f, 0.0f, float(u_n - 1));
+    gz = clamp(p.z / u_dx, 0.0f, float(u_n));
+    y0 = int(gy); z0 = min(int(gz), u_n - 1);
+    y1 = min(y0 + 1, u_n - 1); z1 = z0 + 1;
+    tx = gx - float(x0); ty = gy - float(y0); tz = gz - float(z0);
+    float vzVal = vz[idZ(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz) + vz[idZ(x1,y0,z0)]*tx*(1-ty)*(1-tz) +
+                  vz[idZ(x0,y1,z0)]*(1-tx)*ty*(1-tz) + vz[idZ(x1,y1,z0)]*tx*ty*(1-tz) +
+                  vz[idZ(x0,y0,z1)]*(1-tx)*(1-ty)*tz + vz[idZ(x1,y0,z1)]*tx*(1-ty)*tz +
+                  vz[idZ(x0,y1,z1)]*(1-tx)*ty*tz + vz[idZ(x1,y1,z1)]*tx*ty*tz;
+    return vec3(vxVal, vyVal, vzVal);
+}
+float sampleSrc(vec3 p) {
+    float dx = u_dx; int n = u_n;
+    if (u_mode == 0) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=int(gy), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idC(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idC(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idC(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idC(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idC(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idC(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idC(x0,y1,z1)]*(1-tx)*ty*tz+src[idC(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 1) {
+        float gx = clamp(p.x/dx, 0.0f, float(n));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=min(int(gx),n-1), y0=int(gy), z0=int(gz);
+        int x1=x0+1, y1=min(y0+1,n-1), z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idX(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idX(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idX(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idX(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idX(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idX(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idX(x0,y1,z1)]*(1-tx)*ty*tz+src[idX(x1,y1,z1)]*tx*ty*tz;
+    } else if (u_mode == 2) {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx, 0.0f, float(n));
+        float gz = clamp(p.z/dx-0.5f, 0.0f, float(n-1));
+        int x0=int(gx), y0=min(int(gy),n-1), z0=int(gz);
+        int x1=min(x0+1,n-1), y1=y0+1, z1=min(z0+1,n-1);
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idY(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idY(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idY(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idY(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idY(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idY(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idY(x0,y1,z1)]*(1-tx)*ty*tz+src[idY(x1,y1,z1)]*tx*ty*tz;
+    } else {
+        float gx = clamp(p.x/dx-0.5f, 0.0f, float(n-1));
+        float gy = clamp(p.y/dx-0.5f, 0.0f, float(n-1));
+        float gz = clamp(p.z/dx, 0.0f, float(n));
+        int x0=int(gx), y0=int(gy), z0=min(int(gz),n-1);
+        int x1=min(x0+1,n-1), y1=min(y0+1,n-1), z1=z0+1;
+        float tx=gx-float(x0), ty=gy-float(y0), tz=gz-float(z0);
+        return src[idZ(x0,y0,z0)]*(1-tx)*(1-ty)*(1-tz)+src[idZ(x1,y0,z0)]*tx*(1-ty)*(1-tz)+
+               src[idZ(x0,y1,z0)]*(1-tx)*ty*(1-tz)+src[idZ(x1,y1,z0)]*tx*ty*(1-tz)+
+               src[idZ(x0,y0,z1)]*(1-tx)*(1-ty)*tz+src[idZ(x1,y0,z1)]*tx*(1-ty)*tz+
+               src[idZ(x0,y1,z1)]*(1-tx)*ty*tz+src[idZ(x1,y1,z1)]*tx*ty*tz;
+    }
+}
+int srcIdx(int i) { if (u_mode == 1) return i; if (u_mode == 2) return i; return i; }
+vec3 facePos(int x, int y, int z) {
+    float dx = u_dx;
+    if (u_mode == 0) return vec3((x+0.5f)*dx, (y+0.5f)*dx, (z+0.5f)*dx);
+    if (u_mode == 1) return vec3(float(x)*dx, (y+0.5f)*dx, (z+0.5f)*dx);
+    if (u_mode == 2) return vec3((x+0.5f)*dx, float(y)*dx, (z+0.5f)*dx);
+    return vec3((x+0.5f)*dx, (y+0.5f)*dx, float(z)*dx);
+}
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), z = int(gl_GlobalInvocationID.z);
+    if (u_mode == 0 && (x >= u_n || y >= u_n || z >= u_n)) return;
+    if (u_mode == 1 && (x > u_n || y >= u_n || z >= u_n)) return;
+    if (u_mode == 2 && (x >= u_n || y > u_n || z >= u_n)) return;
+    if (u_mode == 3 && (x >= u_n || y >= u_n || z > u_n)) return;
+    vec3 face = facePos(x, y, z);
+    vec3 v = velocity(face);
+    int i = (u_mode == 0) ? idC(x,y,z) : (u_mode == 1) ? idX(x,y,z) : (u_mode == 2) ? idY(x,y,z) : idZ(x,y,z);
+    fwd[i] = sampleSrc(face - v * u_dt);
+}

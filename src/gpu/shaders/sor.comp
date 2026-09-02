@@ -1,0 +1,19 @@
+#version 430 core
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(std430, binding = 0) buffer PBuf { float p[]; };
+layout(std430, binding = 1) buffer DBuf { float div[]; };
+uniform int u_n, u_parity; uniform float u_omega, u_h2_div_dt;
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), z = int(gl_GlobalInvocationID.z);
+    if (x >= u_n || y >= u_n || z >= u_n) return;
+    if (((x + y + z) & 1) != u_parity) return;
+    const ivec3 nb[6] = { ivec3(-1,0,0), ivec3(1,0,0), ivec3(0,-1,0), ivec3(0,1,0), ivec3(0,0,-1), ivec3(0,0,1) };
+    int i = x + u_n * (y + u_n * z);
+    float sum = 0.0; int terms = 0;
+    for (int k = 0; k < 6; ++k) {
+        int nx = x + nb[k].x, ny = y + nb[k].y, nz = z + nb[k].z;
+        if (nx < 0 || nx >= u_n || ny < 0 || ny >= u_n || nz < 0 || nz >= u_n) { sum += p[i]; ++terms; }
+        else { sum += p[nx + u_n * (ny + u_n * nz)]; ++terms; }
+    }
+    p[i] = (1.0 - u_omega) * p[i] + u_omega * (sum - div[i] * u_h2_div_dt) / float(max(terms, 1));
+}
