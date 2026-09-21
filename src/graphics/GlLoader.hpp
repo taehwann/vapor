@@ -20,6 +20,10 @@ using GLintptr = std::ptrdiff_t;
 #define GL_CLAMP_TO_EDGE 0x812F
 #define GL_RED 0x1903
 #define GL_R16F 0x822D
+#define GL_R32F 0x822E
+#define GL_PIXEL_UNPACK_BUFFER 0x88EC
+#define GL_PIXEL_BUFFER_BARRIER_BIT 0x00000080
+#define GL_BUFFER_UPDATE_BARRIER_BIT 0x00000200
 #define GL_RGBA8 0x8058
 #define GL_FRAMEBUFFER 0x8D40
 #define GL_COLOR_ATTACHMENT0 0x8CE0
@@ -66,13 +70,16 @@ using GLintptr = std::ptrdiff_t;
     X(GLint, glGetUniformLocation, (GLuint, const GLchar*)) \
     X(void, glUniform1i, (GLint, GLint)) \
     X(void, glUniform1f, (GLint, GLfloat)) \
+    X(void, glUniform1d, (GLint, GLdouble)) \
     X(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
+    X(void, glUniform3i, (GLint, GLint, GLint, GLint)) \
     X(void, glActiveTexture, (GLenum)) \
     X(void, glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*)) \
     X(void, glDispatchCompute, (GLuint, GLuint, GLuint)) \
     X(void, glBindBufferBase, (GLenum, GLuint, GLuint)) \
     X(void, glMemoryBarrier, (GLbitfield)) \
     X(void, glBufferSubData, (GLenum, GLintptr, GLsizeiptr, const void*)) \
+    X(void, glClearBufferData, (GLenum, GLenum, GLenum, GLenum, const void*)) \
     X(void, glGetBufferSubData, (GLenum, GLintptr, GLsizeiptr, void*))
 
 #define VAPOR_DECLARE_GL_FUNCTION(return_type, name, arguments) \

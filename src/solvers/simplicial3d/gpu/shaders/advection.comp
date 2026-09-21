@@ -1,0 +1,85 @@
+#version 430 core
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer Geometry {double g[];};
+layout(std430,binding=1) readonly buffer Topology {int topo[];};
+layout(std430,binding=2) readonly buffer Input {double inputData[];};
+layout(std430,binding=3) buffer Traces {double traced[];};
+layout(std430,binding=4) buffer Output {double result[];};
+layout(std430,binding=5) buffer Status {int error;};
+uniform int stage, nDual, nPrimal, nEdges, nNodes, bins;
+uniform double dt, size, decay;
+uniform int dualPosition, nodePosition, tetGeometry, subGradient, wallGeometry;
+uniform int dualHint, primalHint, tetVertices, binOffsets, binItems, wallOffsets, wallItems;
+uniform int subOffsets, subNodes, wallOwners, loopOffsets, loopItems, dualEdges;
+dvec3 geometry3(int index){return dvec3(g[index],g[index+1],g[index+2]);}
+dvec3 input3(int index){return dvec3(inputData[index],inputData[index+1],inputData[index+2]);}
+dvec3 trace3(int index){return dvec3(traced[index],traced[index+1],traced[index+2]);}
+double smallest(dvec4 w){return min(min(w.x,w.y),min(w.z,w.w));}
+dvec4 bary(int t,dvec3 p){
+ int at=tetGeometry+12*t;dvec3 q=p-geometry3(at);
+ dvec3 w=dvec3(dot(geometry3(at+3),q),dot(geometry3(at+6),q),dot(geometry3(at+9),q));
+ return dvec4(1-w.x-w.y-w.z,w);
+}
+ivec3 binOf(dvec3 p){return clamp(ivec3(p/size*double(bins)),ivec3(0),ivec3(bins-1));}
+int binId(ivec3 b){return b.x+bins*(b.y+bins*b.z);}
+int locate(dvec3 p,int hint){
+ if(hint>=0&&smallest(bary(hint,p))>=-1e-9)return hint;
+ if(any(lessThan(p,dvec3(0)))||any(greaterThan(p,dvec3(size))))return -1;
+ int b=binId(binOf(p));
+ for(int i=topo[binOffsets+b];i<topo[binOffsets+b+1];++i){int t=topo[binItems+i];if(smallest(bary(t,p))>=-1e-9)return t;}
+ return -1;
+}
+dvec3 clipSegment(dvec3 start,dvec3 end,int hint){
+ if(hint>=0&&smallest(bary(hint,start))>=-1e-10&&smallest(bary(hint,end))>=-1e-10)return end;
+ dvec3 delta=end-start;double distance=length(delta);if(distance<1e-14*size)return start;
+ double first=1;ivec3 lo=binOf(min(start,end)),hi=binOf(max(start,end));
+ for(int z=lo.z;z<=hi.z;++z)for(int y=lo.y;y<=hi.y;++y)for(int x=lo.x;x<=hi.x;++x){
+  int b=binId(ivec3(x,y,z));
+  for(int i=topo[wallOffsets+b];i<topo[wallOffsets+b+1];++i){
+   int f=topo[wallItems+i],at=wallGeometry+6*f;dvec3 normal=geometry3(at),origin=geometry3(at+3);
+   double denominator=dot(normal,delta);if(denominator<=1e-15*length(normal)*distance)continue;
+   double hit=dot(normal,origin-start)/denominator;if(hit< -1e-9||hit>first)continue;
+   if(smallest(bary(topo[wallOwners+f],start+delta*hit))< -1e-8)continue;
+   first=max(0.,hit);
+  }
+ }
+ return first<1?start+delta*max(0.,first-1e-8):end;
+}
+dvec3 velocity(dvec3 p,int hint){
+ int t=locate(p,hint);if(t<0)return dvec3(0);
+ for(int i=topo[subOffsets+t];i<topo[subOffsets+t+1];++i){
+  ivec4 ids=ivec4(topo[subNodes+4*i],topo[subNodes+4*i+1],topo[subNodes+4*i+2],topo[subNodes+4*i+3]);
+  dvec3 q=p-geometry3(nodePosition+3*ids.x);
+  int at=subGradient+9*i;dvec3 b=dvec3(dot(geometry3(at),q),dot(geometry3(at+3),q),dot(geometry3(at+6),q));
+  dvec4 w=dvec4(1-b.x-b.y-b.z,b);
+  if(smallest(w)>=-1e-8){dvec3 v=dvec3(0);for(int k=0;k<4;++k)v+=w[k]*input3(3*nDual+3*ids[k]);return v;}
+ }
+ atomicOr(error,1);return dvec3(0);
+}
+double density(dvec3 p,int hint){
+ int t=locate(p,hint);if(t<0)return 0;
+ dvec4 w=max(bary(t,p),dvec4(0));double v=0,total=0;
+ for(int k=0;k<4;++k){v+=w[k]*inputData[3*(nDual+nNodes)+topo[tetVertices+4*t+k]];total+=w[k];}
+ return v/total;
+}
+void main(){
+ int i=int(gl_GlobalInvocationID.x);
+ if(stage==0){
+  if(i>=nDual)return;
+  dvec3 p=geometry3(dualPosition+3*i);int hint=topo[dualHint+i];
+  dvec3 middle=clipSegment(p,p-input3(3*i)*(dt*.5),hint);
+  dvec3 q=clipSegment(p,p-velocity(middle,hint)*dt,hint),v=velocity(q,hint);
+  for(int k=0;k<3;++k){traced[6*i+k]=q[k];traced[6*i+3+k]=v[k];}
+ } else if(stage==1){
+  if(i>=nEdges)return;double sum=0;
+  for(int j=topo[loopOffsets+i];j<topo[loopOffsets+i+1];++j){int code=topo[loopItems+j],e=abs(code)-1,a=topo[dualEdges+2*e],b=topo[dualEdges+2*e+1];
+   sum+=.5*double(code>0?1:-1)*dot(trace3(6*a+3)+trace3(6*b+3),trace3(6*b)-trace3(6*a));}
+  result[i]=sum;
+ } else {
+  if(i>=nPrimal)return;
+  dvec3 p=geometry3(nodePosition+3*i);int hint=topo[primalHint+i];
+  dvec3 middle=clipSegment(p,p-input3(3*nDual+3*i)*(dt*.5),hint);
+  dvec3 q=clipSegment(p,p-velocity(middle,hint)*dt,hint);
+  result[i]=density(q,hint)*decay;
+ }
+}

@@ -1,0 +1,48 @@
+#version 430 core
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer MatrixValues {double matrix[];};
+layout(std430,binding=1) readonly buffer MatrixIndices {int indexData[];};
+layout(std430,binding=2) buffer Vectors {double q[];};
+uniform int stage,n,groups,columns;
+uniform double target;
+shared double sums[128];shared double maxima[128];
+int statusBase(){return 6*n+2*groups;}
+double product(int row){double sum=0;for(int j=indexData[row];j<indexData[row+1];++j)sum+=matrix[j]*q[indexData[columns+j]];return sum;}
+void reduce(double sum,double maximum){
+ uint lane=gl_LocalInvocationID.x;sums[lane]=sum;maxima[lane]=maximum;barrier();
+ for(uint step=64;step>0;step/=2){if(lane<step){sums[lane]+=sums[lane+step];maxima[lane]=max(maxima[lane],maxima[lane+step]);}barrier();}
+}
+void main(){
+ int i=int(gl_GlobalInvocationID.x),lane=int(gl_LocalInvocationID.x),s=statusBase();
+ if(stage==0||stage==2||stage==4||stage==7){
+  if(stage!=0&&stage!=7&&q[s+5]!=0)return;
+  double value=0,maximum=0;
+  if(i<n){
+   if(stage==0||stage==7){
+    double r=q[5*n+i]-product(i);q[n+i]=r;maximum=abs(r);
+    if(stage==0){double z=r/matrix[matrix.length()-n+i];q[2*n+i]=z;q[3*n+i]=z;value=r*z;}
+   } else if(stage==2){
+    double ap=0;for(int j=indexData[i];j<indexData[i+1];++j)ap+=matrix[j]*q[3*n+indexData[columns+j]];
+    q[4*n+i]=ap;value=q[3*n+i]*ap;
+   } else {
+    q[i]+=q[s+1]*q[3*n+i];double r=q[n+i]-q[s+1]*q[4*n+i],z=r/matrix[matrix.length()-n+i];
+    q[n+i]=r;q[2*n+i]=z;value=r*z;maximum=abs(r);
+   }
+  }
+  reduce(value,maximum);
+  if(lane==0){q[6*n+int(gl_WorkGroupID.x)]=sums[0];q[6*n+groups+int(gl_WorkGroupID.x)]=maxima[0];}
+ } else if(stage==6){
+  if(i<n&&q[s+5]==0)q[3*n+i]=q[2*n+i]+q[s+2]*q[3*n+i];
+ } else {
+  if(stage!=1&&stage!=8&&q[s+5]!=0)return;
+  double value=0,maximum=0;
+  for(int j=lane;j<groups;j+=128){value+=q[6*n+j];maximum=max(maximum,q[6*n+groups+j]);}
+  reduce(value,maximum);
+  if(lane==0){
+   if(stage==1){q[s]=sums[0];q[s+3]=maxima[0];q[s+4]=maxima[0];q[s+5]=maxima[0]<=target?1:0;q[s+6]=0;q[s+7]=0;}
+   else if(stage==3){if(sums[0]<=0||isnan(sums[0])||isinf(sums[0])){q[s+5]=2;q[s+7]=1;}else q[s+1]=q[s]/sums[0];}
+   else if(stage==5){q[s+2]=sums[0]/q[s];q[s]=sums[0];q[s+4]=maxima[0];q[s+6]+=1;if(maxima[0]<=target)q[s+5]=1;}
+   else {q[s+4]=maxima[0];q[s+5]=maxima[0]<=target?1:0;}
+  }
+ }
+}

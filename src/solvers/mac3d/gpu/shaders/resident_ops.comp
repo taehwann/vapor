@@ -1,0 +1,45 @@
+#version 430 core
+layout(local_size_x=8,local_size_y=8,local_size_z=4) in;
+layout(std430,binding=0) buffer X { float vx[]; };
+layout(std430,binding=1) buffer Y { float vy[]; };
+layout(std430,binding=2) buffer Z { float vz[]; };
+layout(std430,binding=3) buffer Smoke { float smoke[]; };
+layout(std430,binding=4) readonly buffer Noise { float noise[]; };
+layout(std430,binding=5) buffer HX { float hx[]; };
+layout(std430,binding=6) buffer HY { float hy[]; };
+layout(std430,binding=7) buffer HZ { float hz[]; };
+uniform int u_n,u_mode;
+uniform ivec3 u_emitLo,u_emitSize;
+uniform float u_kick,u_force,u_split,u_decay;
+int idC(ivec3 p){return p.x+u_n*(p.y+u_n*p.z);}
+int idX(ivec3 p){return p.x+(u_n+1)*(p.y+u_n*p.z);}
+int idY(ivec3 p){return p.x+u_n*(p.y+(u_n+1)*p.z);}
+int idZ(ivec3 p){return idC(p);}
+float emission(ivec3 p){ivec3 q=p-u_emitLo;if(any(lessThan(q,ivec3(0)))||any(greaterThanEqual(q,u_emitSize)))return 1e20;return noise[q.x+u_emitSize.x*(q.y+u_emitSize.y*q.z)];}
+void main(){
+ ivec3 p=ivec3(gl_GlobalInvocationID);int n=u_n;
+ bool cell=all(lessThan(p,ivec3(n)));
+ bool xf=p.x<=n&&p.y<n&&p.z<n;
+ bool yf=p.x<n&&p.y<=n&&p.z<n;
+ bool zf=p.x<n&&p.y<n&&p.z<=n;
+ if(u_mode==0){
+  float j=emission(p);
+  if(cell&&j<1e19)smoke[idC(p)]=1.;
+  if(xf){float a=emission(p-ivec3(1,0,0));if(a<1e19)vx[idX(p)]+=a;if(j<1e19)vx[idX(p)]+=j;}
+  if(yf){float a=emission(p-ivec3(0,1,0));if(a<1e19)vy[idY(p)]+=a;if(j<1e19)vy[idY(p)]+=j;}
+  if(u_kick>0.&&zf&&(j<1e19||emission(p-ivec3(0,0,1))<1e19))vz[idZ(p)]=max(vz[idZ(p)],u_kick);
+ }else if(u_mode==1||u_mode==2){
+  if(u_mode==1&&zf&&p.z>0&&p.z<n){
+   precise float a=u_force*smoke[idC(p-ivec3(0,0,1))];
+   precise float b=u_force*smoke[idC(p)];
+   vz[idZ(p)]+=u_split*a;vz[idZ(p)]+=u_split*b;
+  }
+  if(xf&&(p.x==0||p.x==n))vx[idX(p)]=0.;
+  if(yf&&(p.y==0||p.y==n))vy[idY(p)]=0.;
+  if(zf&&(p.z==0||p.z==n))vz[idZ(p)]=0.;
+ }else if(u_mode==3){
+  if(xf)hx[idX(p)]=2.*vx[idX(p)]-hx[idX(p)];
+  if(yf)hy[idY(p)]=2.*vy[idY(p)]-hy[idY(p)];
+  if(zf)hz[idZ(p)]=2.*vz[idZ(p)]-hz[idZ(p)];
+ }else if(u_mode==4&&cell)smoke[idC(p)]*=u_decay;
+}

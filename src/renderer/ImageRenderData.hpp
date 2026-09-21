@@ -6,4 +6,5 @@ struct ImageRenderData {
     std::span<const float> density;
     int width = 0, height = 0;
     float worldWidth = 1.f, worldHeight = 1.f;
+    bool historicalPalette = false;
 };

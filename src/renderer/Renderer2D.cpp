@@ -96,6 +96,7 @@ void Renderer2D::render(const ImageRenderData& data, int w, int h, float exposur
     glUseProgram(program_);
     glUniform1i(glGetUniformLocation(program_, "u_Density"), 0);
     glUniform1f(glGetUniformLocation(program_, "u_Exposure"), exposure);
+    glUniform1i(glGetUniformLocation(program_, "u_HistoricalPalette"), data.historicalPalette);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);

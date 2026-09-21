@@ -1,5 +1,5 @@
-#include "fluid/MacGridFluidSolver2D.hpp"
-#include "presentation/MacGridPresentationAdapter2D.hpp"
+#include "solvers/mac2d/MacGridFluidSolver2D.hpp"
+#include "renderer/MacRenderData2D.hpp"
 #include "renderer/Renderer2D.hpp"
 #include "graphics/GlLoader.hpp"
 #include <algorithm>
@@ -39,22 +39,27 @@ int main(int argc, char** argv) {
         auto blueAt = [&](int x, int y) { return pixels[3 * (x + w * y) + 2]; };
         MacGridState2D state(8);
         for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) state.density()[state.idC(x, y)] = 1.f;
-        MacGridPresentationAdapter2D presentation(state);
-        renderer.init(presentation.renderData());
-        draw(presentation.renderData());
+
+        renderer.init(imageData(state));
+        draw(imageData(state));
         require(blueAt(w / 4, h / 4) > 200, "2D density is not visible in the lower-left quadrant");
         require(blueAt(w / 4, 3 * h / 4) < 5 && blueAt(3 * w / 4, h / 4) < 5, "2D image orientation or sampling is wrong");
 
         MacGridState2D resized(16);
         for (int y = 8; y < 16; ++y) for (int x = 8; x < 16; ++x) resized.density()[resized.idC(x, y)] = 1.f;
-        MacGridPresentationAdapter2D resizedView(resized);
-        draw(resizedView.renderData());
+
+        draw(imageData(resized));
         require(blueAt(3 * w / 4, 3 * h / 4) > 200 && blueAt(w / 4, h / 4) < 5, "Texture resize retained stale data");
-        draw(resizedView.renderData(), 0.f);
+        draw(imageData(resized), 0.f);
         require(*std::max_element(pixels.begin(), pixels.end()) < 5, "Zero exposure should produce a black image");
+        auto historical = imageData(resized);
+        historical.historicalPalette = true;
+        draw(historical);
+        require(std::abs(int(blueAt(w/4,h/4))-18)<=1 &&
+                std::abs(int(blueAt(3*w/4,3*h/4))-222)<=1, "Historical palette differs from ba20987");
 
         std::fill(resized.density().begin(), resized.density().end(), 1.f);
-        auto wide = resizedView.renderData();
+        auto wide = imageData(resized);
         wide.worldWidth = 2.f; wide.worldHeight = 1.f;
         draw(wide);
         require(blueAt(w / 2, h / 2) > 200 && blueAt(w / 2, h / 8) < 5, "2D physical aspect ratio is not preserved");
@@ -66,14 +71,14 @@ int main(int argc, char** argv) {
 
         // Real solver -> borrowed adapter -> texture upload -> pixels.
         MacGridFluidSolver2D solver(32);
-        IFluidSolver& fluid = solver;
+        auto& fluid = solver;
         require(fluid.domain().dimension() == Dimension::D2, "2D fluid dimension");
         for (int i = 0; i < 120; ++i) fluid.advance(1.f / 60.f);
-        MacGridPresentationAdapter2D smoke(solver.state());
+
         renderer.shutdown();
         renderer.shutdown();
-        renderer.init(smoke.renderData());
-        draw(smoke.renderData());
+        renderer.init(imageData(solver.state()));
+        draw(imageData(solver.state()));
         const auto lit = std::count_if(pixels.begin(), pixels.end(), [](unsigned char v) { return v > 32; });
         require(lit > std::ptrdiff_t(pixels.size() / 100), "2D smoke solver rendered no substantial plume");
         if (argc > 1) {

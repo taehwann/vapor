@@ -1,4 +1,4 @@
-#include "fluid/MacGridFluidSolver.hpp"
+#include "solvers/mac3d/MacGridFluidSolver3D.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -41,10 +41,69 @@ void near(double actual, double expected, const char* name) {
 }
 }
 
-int main() {
+void seededReplay() {
+    MacGridFluidSolver3D first(8), second(8), other(8);
+    for (auto* solver : {&first, &second, &other}) {
+        solver->parameters().emitterRadius = .18f;
+        solver->parameters().emitterCenterZ = .3f;
+        solver->parameters().projectIterations = 16;
+        solver->parameters().randomSeed = 12345;
+        solver->resetState();
+    }
+    other.parameters().randomSeed = 54321;
+    other.resetState();
+    for (int frame = 0; frame < 6; ++frame) {
+        first.advance(1.f / 60.f);
+        other.advance(1.f / 60.f); // Must not perturb the other solvers' random streams.
+        second.advance(1.f / 60.f);
+    }
+    auto equal = [](std::span<const float> a, std::span<const float> b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+    };
+    if (!equal(first.state().velocityX(), second.state().velocityX()) ||
+        !equal(first.state().density(), second.state().density()))
+        throw std::runtime_error("Seeded solvers depend on each other's random stream");
+    if (equal(first.state().velocityX(), other.state().velocityX()))
+        throw std::runtime_error("Different stirring seeds produced identical velocity");
+    first.resetState();
+    for (int frame = 0; frame < 6; ++frame) first.advance(1.f / 60.f);
+    if (!equal(first.state().velocityX(), second.state().velocityX()) ||
+        !equal(first.state().velocityY(), second.state().velocityY()) ||
+        !equal(first.state().velocityZ(), second.state().velocityZ()) ||
+        !equal(first.state().density(), second.state().density()))
+        throw std::runtime_error("Reset did not reproduce the seeded simulation");
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string(argv[1]) == "plume") {
+            for (bool reflection : {false, true}) {
+                MacGridFluidSolver3D solver(24);
+                solver.parameters().reflection = reflection;
+                solver.parameters().projectIterations = 300;
+                solver.parameters().emitterRadius = .08f;
+                solver.parameters().sorOmega = 1.8f;
+                for (int frame = 0; frame < 180; ++frame) {
+                    solver.advance(1.f / 60.f);
+                    const auto d = solver.diagnostics();
+                    if (!std::isfinite(d.kineticEnergy) || !std::isfinite(d.maxDivergence) || d.maxDivergence > .005f)
+                        throw std::runtime_error("3D plume became non-finite or lost incompressibility");
+                    for (float value : solver.state().density())
+                        if (!std::isfinite(value) || value < 0.f || value > 1.00001f)
+                            throw std::runtime_error("3D plume density outside limiter bounds");
+                }
+                std::cout << "3D plume reflection=" << reflection << " energy=" << solver.kineticEnergy()
+                          << " divergence=" << solver.computeDivergenceNorm() << '\n';
+            }
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "seeded_replay") {
+            seededReplay();
+            std::cout << "PASS independent random streams and reset replay\n";
+            return 0;
+        }
         for (const auto& baseline : baselines) {
-            MacGridFluidSolver solver(baseline.n);
+            MacGridFluidSolver3D solver(baseline.n);
             solver.parameters().stirStrength=0.f;
             solver.parameters().emitterRadius=.18f;
             solver.parameters().emitterCenterZ=.3f;
@@ -52,7 +111,7 @@ int main() {
             solver.parameters().macCormackVel=(baseline.flags & 2)!=0;
             solver.parameters().reflection = baseline.reflect != 0;
             solver.parameters().projectIterations = 16;
-            IFluidSolver& interface = solver;
+            auto& interface = solver;
             for (int frame=0; frame<6; ++frame) {
                 interface.advance(1.f/60.f);
             }

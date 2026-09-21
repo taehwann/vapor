@@ -1,6 +1,7 @@
-#include "fluid/MacGridFluidSolver2D.hpp"
-#include "fluid/MacGridOperators2D.hpp"
-#include "presentation/MacGridPresentationAdapter2D.hpp"
+#include "solvers/mac2d/MacGridFluidSolver2D.hpp"
+#include "solvers/mac2d/ReflectionMacFluidSolver2D.hpp"
+#include "solvers/mac2d/MacGridOperators2D.hpp"
+#include "renderer/MacRenderData2D.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -45,7 +46,7 @@ ProjectionOptions accurate(float dt = .02f) {
 void grid() {
     for (int n : {1, 2, 7}) {
         MacGridState2D s(n, 3.f);
-        const IDomain& domain = s.domain();
+        const auto& domain = s.domain();
         require(domain.dimension() == Dimension::D2, "2D dimension tag");
         near(domain.bounds().max.z, 0, 0, "Planar bounds");
         near(s.cellSize(), 3.0 / n, 1e-6, "2D cell spacing");
@@ -77,7 +78,7 @@ void advection() {
     std::fill(s.velocityX().begin(), s.velocityX().end(), .5f);
     std::fill(s.velocityY().begin(), s.velocityY().end(), -.25f);
     SemiLagrangian2D sl;
-    const IAdvection<MacAdvectionOperation2D>& transport = sl;
+    const SemiLagrangian2D& transport = sl;
     constexpr float dt = .125f;
     for (auto kind : {MacField2D::Density, MacField2D::VelocityX, MacField2D::VelocityY}) {
         const int w = 8 + (kind == MacField2D::VelocityX), h = 8 + (kind == MacField2D::VelocityY);
@@ -110,7 +111,7 @@ void advection() {
 }
 void projectionGradient() {
     CpuPressureSolver2D solver;
-    IPressureSolver<MacGridState2D>& projection = solver;
+    CpuPressureSolver2D& projection = solver;
     for (int n : {1, 8, 15}) for (float box : {1.f, 3.f}) for (float dt : {.01f, .1f}) {
         MacGridState2D s(n, box);
         std::vector<float> exact(n * n);
@@ -208,8 +209,25 @@ double centerY(const MacGridState2D& s) {
     return moment / mass;
 }
 void simulation() {
+    // Isolate the source from transport/projection. It must agree with the
+    // reference inlet, including weak/disabled sources and saturated density.
+    for (float strength : {0.f, .1f, 1.f, 4.f}) {
+        ReflectionMacFluidSolver2D reference(64);
+        MacGridFluidSolver2D source(64, 1.f);
+        source.parameters().sourceStrength = strength;
+        source.parameters().buoyancy = source.parameters().smokeDecay = 0.f;
+        source.parameters().projectIterations = 0;
+        reference.emit(strength, 1e-10f);
+        reference.applyBoundary();
+        source.advance(1e-10f);
+        same(source.state().density(), reference.smoke);
+        same(source.state().velocityY(), reference.vy);
+        source.advance(1e-10f);
+        same(source.state().density(), reference.smoke);
+        same(source.state().velocityY(), reference.vy);
+    }
     MacGridFluidSolver2D solver(24);
-    IFluidSolver& fluid = solver;
+    auto& fluid = solver;
     solver.parameters().sourceStrength = 0.f;
     for (int i = 0; i < 5; ++i) fluid.advance(1.f / 60.f);
     near(fluid.diagnostics().kineticEnergy, 0, 0, "Rest energy");
@@ -235,57 +253,97 @@ void simulation() {
     for (float d : solver.state().density()) near(d, 0, 0, "Reset smoke");
     near(fluid.diagnostics().kineticEnergy, 0, 0, "Reset energy");
 }
-class RecordingPressure final : public IPressureSolver<MacGridState2D> {
-public:
-    ProjectionResult project(MacGridState2D& s, const ProjectionOptions& o) override {
-        ++calls; dt = o.dt; return cpu.project(s, o);
+void reflection() {
+    // A projected force has an independently known first-order response dt*P(f).
+    // This catches missing/doubled buoyancy in the reflected half-step.
+    MacGridState2D initial(20, 4.f);
+    for (int y=0; y<20; ++y) for (int x=0; x<20; ++x)
+        initial.density()[initial.idC(x,y)] = float(std::exp(-.08*((x-8)*(x-8)+(y-7)*(y-7))));
+    auto expected = initial;
+    constexpr float dt = 1e-4f;
+    for (int y=1; y<20; ++y) for (int x=0; x<20; ++x)
+        expected.velocityY()[expected.idY(x,y)] = dt * 3.f * .5f *
+            (std::pow(initial.density()[initial.idC(x,y-1)], .25f) +
+             std::pow(initial.density()[initial.idC(x,y)], .25f));
+    CpuPressureSolver2D pressure;
+    pressure.project(expected, accurate(dt));
+    MacGridFluidSolver2D simpleForced(initial);
+    simpleForced.parameters().sourceStrength = simpleForced.parameters().smokeDecay = 0.f;
+    simpleForced.advance(dt);
+    same(simpleForced.state().velocityX(), expected.velocityX(), 2e-7f);
+    same(simpleForced.state().velocityY(), expected.velocityY(), 2e-7f);
+    MacGridFluidSolver2D forced(initial);
+    forced.parameters().reflection = true;
+    forced.parameters().sourceStrength = forced.parameters().smokeDecay = 0.f;
+    forced.advance(dt);
+    same(forced.state().velocityX(), expected.velocityX(), 2e-7f);
+    same(forced.state().velocityY(), expected.velocityY(), 2e-7f);
+
+    // A nonuniform solenoidal vortex exercises transport of distinct reflected
+    // components through one immutable midpoint velocity.
+    const auto psi = [](int x, int y) {
+        return .8 * std::sin(std::numbers::pi * x / 20.) * std::sin(2. * std::numbers::pi * y / 20.);
+    };
+    for (int y=0; y<20; ++y) for (int x=0; x<=20; ++x)
+        initial.velocityX()[initial.idX(x,y)] = float((psi(x,y+1)-psi(x,y)) / initial.cellSize());
+    for (int y=0; y<=20; ++y) for (int x=0; x<20; ++x)
+        initial.velocityY()[initial.idY(x,y)] = float(-(psi(x+1,y)-psi(x,y)) / initial.cellSize());
+    MacGridFluidSolver2D reflected(initial), simple(initial), replay(initial);
+    for (auto* solver : {&reflected, &simple, &replay}) {
+        solver->parameters().sourceStrength = 0.f;
+        solver->parameters().buoyancy = 0.f;
+        solver->parameters().reflection = solver != &simple;
     }
-    void reset() noexcept override { ++resets; cpu.reset(); }
-    CpuPressureSolver2D cpu;
-    int calls = 0, resets = 0;
-    float dt = 0.f;
-};
-class RecordingAdvection final : public IAdvection<MacAdvectionOperation2D> {
-public:
-    std::string_view name() const noexcept override { return "2D recording advection"; }
-    void advect(const MacAdvectionOperation2D& op) const override {
-        if (op.field == MacField2D::VelocityX) {
-            oldU.assign(op.velocityX.begin(), op.velocityX.end());
-            oldV.assign(op.velocityY.begin(), op.velocityY.end());
-        } else if (op.field == MacField2D::VelocityY) {
-            same(op.velocityX, oldU, 0.f); same(op.velocityY, oldV, 0.f);
-        }
-        ++calls;
-        cpu.advect(op);
+    for (int frame=0; frame<40; ++frame) {
+        reflected.advance(.02f);
+        simple.advance(.02f);
+        replay.advance(.02f);
+        require(reflected.midpointProjection().linearSolve.converged, "Midpoint pressure failed");
+        require(reflected.lastProjection().linearSolve.converged, "Final pressure failed");
+        require(reflected.diagnostics().maxDivergence < 1e-4f, "Reflection divergence");
+        walls(reflected.state());
     }
-    SemiLagrangian2D cpu;
-    mutable int calls = 0;
-    mutable std::vector<float> oldU, oldV;
-};
-void interfaces() {
-    MacGridFluidSolver2D solver(16), reference(16);
-    RecordingPressure pressure;
-    RecordingAdvection advection;
-    solver.setPressureSolver(pressure);
-    solver.setAdvection(advection);
-    IFluidSolver& fluid = solver;
-    MacGridPresentationAdapter2D presentation(solver.state());
-    for (int i = 0; i < 10; ++i) { fluid.advance(.02f); reference.advance(.02f); }
-    require(pressure.calls == 10 && advection.calls == 30, "2D interface dispatch");
-    near(pressure.dt, .02, 1e-8, "2D pressure dt");
-    same(solver.state().density(), reference.state().density());
-    same(solver.state().velocityX(), reference.state().velocityX());
-    same(solver.state().velocityY(), reference.state().velocityY());
-    const auto image = presentation.renderData();
-    require(image.density.data() == solver.state().density().data() && image.width == 16 && image.height == 16, "2D borrowed image");
-    fluid.resetState();
-    require(pressure.resets == 1, "2D pressure reset dispatch");
-    solver.setBoxSize(2.f);
-    near(presentation.renderData().worldHeight, 2, 0, "Adapter follows domain change");
-    solver.useDefaultAdvection(); solver.useDefaultPressureSolver();
-    fluid.advance(.02f);
-    require(pressure.calls == 10 && advection.calls == 30, "Detached 2D backend still used");
+    same(reflected.state().velocityX(), replay.state().velocityX(), 0.f);
+    same(reflected.state().velocityY(), replay.state().velocityY(), 0.f);
+    double difference=0;
+    for (std::size_t i=0;i<reflected.state().velocityX().size();++i)
+        difference=std::max(difference,double(std::abs(reflected.state().velocityX()[i]-simple.state().velocityX()[i])));
+    std::cout << "reflection energy=" << reflected.diagnostics().kineticEnergy
+              << " simple energy=" << simple.diagnostics().kineticEnergy << " difference=" << difference << '\n';
+    require(difference > 1e-4, "Reflection must differ from simple stepping");
+    reflected.resetState();
+    require(!reflected.midpointProjection().residualAvailable, "Reset midpoint diagnostics");
+    reflected.advance(.02f);
+    near(reflected.diagnostics().kineticEnergy, 0., 0., "Reflection reset/rest");
+
+    // Default-resolution plume with forcing and both projection stages active.
+    MacGridFluidSolver2D plume(64);
+    plume.parameters().reflection = true;
+    for (int frame=0;frame<240;++frame) {
+        plume.advance(1.f/60.f);
+        require(plume.midpointProjection().linearSolve.converged, "Plume midpoint convergence");
+        require(plume.lastProjection().linearSolve.converged, "Plume final convergence");
+        require(plume.diagnostics().maxDivergence < .001f, "Reflected plume divergence");
+        for (float d : plume.state().density()) require(std::isfinite(d) && d>=0.f, "Reflected plume density");
+    }
+    std::cout << "reflection plume energy=" << plume.diagnostics().kineticEnergy
+              << " divergence=" << plume.diagnostics().maxDivergence << '\n';
 }
+
+void presentation() {
+    MacGridFluidSolver2D solver(16);
+    for (int i = 0; i < 10; ++i) solver.advance(.02f);
+    const auto image = imageData(solver.state());
+    require(image.density.data() == solver.state().density().data() && image.width == 16 && image.height == 16,
+            "2D borrowed image");
+    solver.resetState();
+    for (float d : solver.state().density()) near(d, 0, 0, "Reset density");
+    solver.setBoxSize(2.f);
+    near(imageData(solver.state()).worldHeight, 2, 0, "View follows domain change");
+    solver.advance(.02f);
+    require(solver.lastProjection().residualAvailable, "CPU projection diagnostics");
+}
+
 }
 int main(int argc, char** argv) {
     try {
@@ -296,7 +354,8 @@ int main(int argc, char** argv) {
         else if (name == "mac2d_projection_solenoidal") projectionSolenoidal();
         else if (name == "mac2d_projection_options") projectionOptions();
         else if (name == "mac2d_simulation") simulation();
-        else if (name == "mac2d_interfaces") interfaces();
+        else if (name == "mac2d_reflection") reflection();
+        else if (name == "mac2d_presentation") presentation();
         else throw std::invalid_argument("Unknown 2D test case");
         std::cout << "PASS " << name << '\n';
     } catch (const std::exception& error) {

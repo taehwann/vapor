@@ -2,6 +2,7 @@
 
 // Generated at configure time from the standalone GLSL files.
 namespace ShaderSources {
+inline constexpr char residentOps[] = R"glsl(@residentOps@)glsl";
 inline constexpr char divSrc[] = R"glsl(@divSrc@)glsl";
 
 inline constexpr char rbgsSrc[] = R"glsl(@rbgsSrc@)glsl";
@@ -20,4 +21,6 @@ inline constexpr char frag[] = R"glsl(@frag@)glsl";
 
 inline constexpr char imageVert[] = R"glsl(@imageVert@)glsl";
 inline constexpr char imageFrag[] = R"glsl(@imageFrag@)glsl";
+inline constexpr char simplicialAdvection[] = R"glsl(@simplicialAdvection@)glsl";
+inline constexpr char simplicialRecovery[] = R"glsl(@simplicialRecovery@)glsl";
 }
