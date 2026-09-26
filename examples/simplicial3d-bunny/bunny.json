@@ -1,0 +1,8 @@
+{
+  "source": "https://people.csail.mit.edu/bmcutler/PROJECTS/SGP04/meshes/bunny_2K.tet",
+  "source_sha256": "aaa1c43bcd743028887224116005214a04ea843666c41bf3b81ee5cee330b399",
+  "vertices": 443,
+  "tetrahedra": 1996,
+  "transform": "(x,-z,y); centered, longest extent 0.9",
+  "purpose": "Geometry visualization; not certified for the circumcentric fluid solver"
+}

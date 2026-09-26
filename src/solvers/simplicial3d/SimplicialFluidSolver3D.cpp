@@ -327,6 +327,8 @@ void SimplicialFluidSolver3D::setBoundaryFlux(std::span<const double> boundary) 
 }
 // Section 4.4: one flux-consistent vector per tet circumcenter.
 void SimplicialFluidSolver3D::reconstructVelocity(bool initializeBoundary) {
+    const bool prescribedNormalFlow = mesh_.boxDomain &&
+        std::any_of(harmonic_.begin(), harmonic_.end(), [](double flux) { return flux != 0; });
     for (size_t i = 0; i < dual_.vertices.size(); ++i) {
         int ti = dual_.vertices[i].tet;
         if (ti < 0)
@@ -351,7 +353,7 @@ void SimplicialFluidSolver3D::reconstructVelocity(bool initializeBoundary) {
         Point velocity = mesh_.boxDomain ? BoundaryCirculation::tangent(dualVelocity_[nearest], v.walls)
                                         : tangentToNormals(dualVelocity_[nearest],v.normals);
         // Nonzero normal boundary flow is supplied by the precomputed harmonic field.
-        for (int axis = 0; mesh_.boxDomain && axis < 3; ++axis)
+        for (int axis = 0; prescribedNormalFlow && axis < 3; ++axis)
             if (v.walls & (3u << (2 * axis))) {
                 double best = 1e300, normalVelocity = 0;
                 for (size_t f = 0; f < mesh_.faces.size(); ++f) {
@@ -379,7 +381,12 @@ void SimplicialFluidSolver3D::reconstructVelocity(bool initializeBoundary) {
         dualVelocity_[i] = velocity;
     }
     auto inside = curl(flux_);
-    if (initializeBoundary) {
+    // Closed box walls use a flux-derived slip trace. Projection onto the wall
+    // tangent space cannot amplify its interior reference velocity. Boundary
+    // circulation is dependent on this trace, as in the 2D solver; independently
+    // transported boundary circulation is not enforced on tiny clipped faces.
+    // This boundary discretization is not exact Kelvin transport at the wall.
+    if (initializeBoundary || mesh_.boxDomain) {
         std::vector<double> wall(dual_.edges.size(), 0);
         for (size_t i = 0; i < wall.size(); ++i) {
             auto e = dual_.edges[i];
@@ -395,7 +402,12 @@ void SimplicialFluidSolver3D::reconstructVelocity(bool initializeBoundary) {
     // Section 4.5: complementary circulation closes every truncated dual face.
     for (size_t e = 0; e < omega_.size(); ++e)
         boundaryCirculation_[e] = mesh_.edges[e].boundary ? omega_[e] - inside[e] : 0;
-    boundarySolve_ = boundary_.reconstruct(dual_, boundaryCirculation_, dualVelocity_, parameters_.cgIterations);
+    if (mesh_.boxDomain) {
+        boundarySolve_ = {};
+        boundarySolve_.converged = true;
+    } else {
+        boundarySolve_ = boundary_.reconstruct(dual_, boundaryCirculation_, dualVelocity_, parameters_.cgIterations);
+    }
     dual_.prepareInterpolation(dualVelocity_);
 }
 Point SimplicialFluidSolver3D::sampleVelocity(Point p) const {
@@ -506,12 +518,20 @@ void SimplicialFluidSolver3D::emitSmoke() {
     double radius = parameters_.emitterRadius * mesh_.size;
     std::vector<double> added(vertexDensity_.size(), 0);
     timings_.sourceVertices = 0;
-    for (size_t i = 0; i < vertexDensity_.size(); ++i)
-        if (length(mesh_.vertices[i] - emitter) < radius) {
+    for (size_t i = 0; i < vertexDensity_.size(); ++i) {
+        const Point offset = mesh_.vertices[i] - emitter;
+        const double normalizedSquared = dot(offset, offset) / (radius * radius);
+        if (normalizedSquared <= 1) {
             ++timings_.sourceVertices;
-            added[i] = std::max(0., double(parameters_.sourceStrength - vertexDensity_[i]));
-            vertexDensity_[i] = std::max(vertexDensity_[i], parameters_.sourceStrength);
+            // Match the 2D box's concentration profile. This caps injected smoke,
+            // not the transported field, and introduces no advection limiter.
+            const float source = mesh_.boxDomain
+                ? float(std::min(1., 3. * parameters_.sourceStrength * std::exp(-3.5 * normalizedSquared)))
+                : parameters_.sourceStrength;
+            added[i] = std::max(0., double(source - vertexDensity_[i]));
+            vertexDensity_[i] = std::max(vertexDensity_[i], source);
         }
+    }
     // Exact mass increment for the piecewise-linear concentration field.
     for (const auto& tet : mesh_.tets)
         for (int v : tet.vertices) timings_.emittedMass += .25 * tet.volume * added[v];
@@ -559,8 +579,8 @@ void SimplicialFluidSolver3D::substep(double dt) {
     ++timings_.substeps;
     emitSmoke();
     timings_.emissionMs+=elapsed();
-    // Figure 6, in order. No energy scaling, circulation correction, or
-    // velocity projection is inserted between these inviscid paper operations.
+    // Inviscid circulation transport followed by flux recovery. Box recovery
+    // closes dependent boundary circulation using its flux-derived slip trace.
     advectVorticity(dt);
     timings_.advectionMs+=elapsed();
     applyBuoyancy(dt);
@@ -610,17 +630,23 @@ void SimplicialFluidSolver3D::advance(float dt) {
         !std::isfinite(parameters_.stirRadius) || parameters_.stirRadius <= 0 ||
         !std::isfinite(parameters_.stirFrequency) || parameters_.stirFrequency < 0)
         throw std::invalid_argument("Invalid simplicial fluid parameters");
-    if(mesh_.boxDomain){substep(dt);return;}
     double remaining=dt;
     int count=0;
     while(remaining>1e-10) {
         double speed=0;for(auto v:dualVelocity_)speed=std::max(speed,length(v));
         double acceleration=std::abs(parameters_.buoyancy)*parameters_.sourceStrength;
+        if(mesh_.boxDomain) {
+            // Existing smoke continues to exert buoyancy with its emitter off.
+            double densityBound=*std::max_element(vertexDensity_.begin(),vertexDensity_.end());
+            if(parameters_.emitterEnabled)densityBound=std::max(densityBound,std::min(1.,3.*parameters_.sourceStrength));
+            acceleration=std::abs(parameters_.buoyancy)*densityBound;
+        }
         if(parameters_.emitterEnabled && parameters_.sourceStrength>0)
             acceleration += parameters_.stirStrength;
         double h=parameters_.advectionCfl*mesh_.minAltitude;
         double step=std::min(remaining,2*h/(speed+std::sqrt(speed*speed+4*acceleration*h)+1e-12));
-        if(++count>2048)throw std::runtime_error("Bunny CFL subdivision exceeded 2048 steps");
+        if(!(step>0)||!std::isfinite(step)||++count>2048)
+            throw std::runtime_error("Simplicial CFL subdivision could not make stable progress");
         substep(step);remaining-=step;
     }
 }

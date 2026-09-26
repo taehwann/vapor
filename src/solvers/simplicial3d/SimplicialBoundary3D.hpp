@@ -11,11 +11,13 @@ class BoundaryCirculation {
 public:
     BoundaryCirculation(const Mesh& mesh,const DualMesh& dual);
     static Point tangent(Point p,unsigned wallMask);
+    double wallRowL1(int primalEdge) const { return wallRowL1_.at(primalEdge); }
     LinearSolveResult reconstruct(const DualMesh& dual,std::span<const double> missing,
                                  std::vector<Point>& velocity,int maxIterations) const;
 private:
     struct Coefficient {int vertex;Point value;};
     struct Row {int primalEdge;std::vector<Coefficient> coefficients;double diagonal=0;};
     std::vector<Row> rows_;
+    std::vector<double> wallRowL1_;
 };
 }

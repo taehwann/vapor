@@ -10,8 +10,19 @@ int main() {
     try {
         auto mesh=Mesh::loadBox("examples/simplicial3d/box.tet",2);
         DualMesh dual(mesh);
+        require(mesh.vertices.size()==343 && mesh.tets.size()==1357,
+                "Box mesh has unexpected resolution");
         for(const auto& t:mesh.tets) {
             Point d=mesh.vertices[t.vertices[0]]-t.center;double radius2=dot(d,d);
+            const auto& v=t.vertices;
+            const Point p0=mesh.vertices[v[0]],p1=mesh.vertices[v[1]],
+                        p2=mesh.vertices[v[2]],p3=mesh.vertices[v[3]];
+            const double surface=(length(cross(p1-p0,p2-p0))+
+                                  length(cross(p1-p0,p3-p0))+
+                                  length(cross(p2-p0,p3-p0))+
+                                  length(cross(p2-p1,p3-p1)))*.5;
+            require(9*t.volume/(surface*std::sqrt(radius2))>=.3,
+                    "Box tetrahedron radius ratio below quality threshold");
             for(auto p:mesh.vertices){Point q=p-t.center;require(dot(q,q)>=radius2-1e-10,"Non-Delaunay tetrahedron");}
         }
         double worst=0,minWeight=1;

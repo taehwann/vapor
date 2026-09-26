@@ -26,7 +26,8 @@ int main() {
               SolverChoice::Mac3DSimpleSLCPU, SolverChoice::Mac3DSimpleSLGPU, SolverChoice::Mac3DSimpleMCCPU,
               SolverChoice::Mac3DSimpleMCGPU, SolverChoice::Mac3DReflectionSLCPU,
               SolverChoice::Mac3DReflectionSLGPU, SolverChoice::Mac3DReflectionMCCPU,
-              SolverChoice::Mac3DReflectionMCGPU, SolverChoice::Simplicial2DTeapot,
+              SolverChoice::Mac3DReflectionMCGPU, SolverChoice::Simplicial2DBox,
+              SolverChoice::Simplicial2DTeapot, SolverChoice::Simplicial3DBox,
               SolverChoice::BunnyMesh}) {
             if (app.runSolver(choice, options) != 0)
                 return 1;

@@ -11,6 +11,7 @@ struct SimplicialFluidParameters3D {
     float advectionCfl = .4f;
     // Local rotating body force; strength is an acceleration bound (world units/s^2).
     float stirStrength = 0, stirRadius = .18f, stirFrequency = 1;
+    // Box source: min(1, 3 * sourceStrength * exp(-3.5 * (distance/radius)^2)).
     float sourceStrength = 4, emitterRadius = .12f, buoyancy = 3, smokeDecay = .08f;
     int cgIterations = 600;
     double cgAbsoluteTolerance = 1e-10, cgRelativeTolerance = 1e-9;
@@ -41,6 +42,8 @@ class SimplicialFluidSolver3D {
     const std::vector<double> &flux() const { return flux_; }
     const std::vector<double> &vorticity() const { return omega_; }
     const std::vector<double> &potential() const { return phi_; }
+    // On boxes this is derived from the recovered slip trace, not an independent
+    // transported constraint. General domains retain their boundary solve.
     const std::vector<double> &boundaryCirculation() const { return boundaryCirculation_; }
     const std::vector<float> &density() const { return density_; }
     const std::vector<float> &vertexDensity() const { return vertexDensity_; }

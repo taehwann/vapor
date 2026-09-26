@@ -136,12 +136,16 @@ int runReflection2D(const RunOptions& options, GLFWwindow* window, AdvectionMeth
     return 0;
 }
 
-int runSimplicial2D(const RunOptions& options, GLFWwindow* window) {
-    SimplicialFluidSolver2D solver{SimplicialFluidState2D{SimplicialMesh2D::teapot()}};
+int runSimplicial2D(SolverChoice choice, const RunOptions& options, GLFWwindow* window) {
+    const bool boxDomain = choice == SolverChoice::Simplicial2DBox;
+    SimplicialFluidSolver2D solver{SimplicialFluidState2D{
+        boxDomain ? SimplicialMesh2D(32, 4.f) : SimplicialMesh2D::teapot()}};
     SimplicialRasterizer2D rasterizer(solver.state());
     Frame2D frame{window, options};
     frame.renderer.init(rasterizer.renderData());
     auto& p = solver.parameters();
+    // Keep the visualization scalar persistent unless fading is requested.
+    p.smokeDecay = 0.f;
     float boxSize = solver.boxSize();
     TetrahedralWireRenderer wires, outline;
     auto updateWires = [&] {
@@ -172,7 +176,7 @@ int runSimplicial2D(const RunOptions& options, GLFWwindow* window) {
             catch(const std::exception& e){captureStatus=e.what();}
             capture=false;
         }
-        ImGui::TextUnformatted("Teapot | inviscid, slip walls");
+        ImGui::TextUnformatted(boxDomain ? "Box | inviscid, slip walls" : "Teapot | inviscid, slip walls");
         ImGui::Text("%zu vertices | %zu triangles",solver.domain().vertexCount(),solver.domain().triangleCount());
         ImGui::Combo("Visualization",&visualization,"Smoke\0Wireframe\0Smoke + wireframe\0");
         if(visualization!=0) {ImGui::Checkbox("Primal (white)",&primal);ImGui::Checkbox("Dual (green)",&dual);}
@@ -223,8 +227,9 @@ int SimulationApp::run2D(SolverChoice choice, const RunOptions& options) {
         return runReflection2D(options, context.window(), AdvectionMethod::SemiLagrangian);
     case SolverChoice::Mac2DReflectionMC:
         return runReflection2D(options, context.window(), AdvectionMethod::MacCormack);
+    case SolverChoice::Simplicial2DBox:
     case SolverChoice::Simplicial2DTeapot:
-        return runSimplicial2D(options, context.window());
+        return runSimplicial2D(choice, options, context.window());
     default:
         throw std::invalid_argument("Expected a 2D solver");
     }

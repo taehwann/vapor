@@ -58,7 +58,8 @@ void recovery() {
     std::cout<<"recovery flux error="<<error(u,s.flux())<<" residual="<<s.lastRecovery().finalResidual<<'\n';
 }
 void circulation() {
-    SimplicialFluidSolver3D s(box(2));seed(s);auto old=s.vorticity();s.advectVorticity(0);
+    SimplicialFluidSolver3D s(box(2));
+    seed(s);auto old=s.vorticity();s.advectVorticity(0);
     require(old==s.vorticity(),"Zero-step changed circulation");
     const auto& dual=s.dual();
     auto clip=[](Point p){return Point{std::clamp(p.x,0.,2.),std::clamp(p.y,0.,2.),std::clamp(p.z,0.,2.)};};
@@ -143,31 +144,161 @@ void contracts() {
     require(failed,"Failed recovery silently accepted");
     s.setBoxSize(2);require(s.boxSize()==2&&s.diagnostics().kineticEnergy==0,"Resize did not reset");
 }
+void checkSlipTrace(const SimplicialFluidSolver3D& s) {
+    double interior=0,wall=0;
+    for(size_t i=0;i<s.dual().vertices.size();++i) {
+        const auto mask=s.dual().vertices[i].walls;
+        const auto v=s.dualVelocity()[i];
+        require(std::isfinite(v.x)&&std::isfinite(v.y)&&std::isfinite(v.z),"Non-finite reconstructed velocity");
+        if(mask) {
+            wall=std::max(wall,length(v));
+            require((!(mask&3)||std::abs(v.x)<1e-12)&&
+                    (!(mask&12)||std::abs(v.y)<1e-12)&&
+                    (!(mask&48)||std::abs(v.z)<1e-12),"Slip trace crosses closed wall");
+        } else interior=std::max(interior,length(v));
+    }
+    require(wall<=interior+1e-10,"Wall reconstruction amplifies the interior velocity");
+    require(s.lastBoundaryReconstruction().iterations==0,"Box unexpectedly used independent wall circulation solve");
+}
 void stability() {
     SimplicialFluidSolver3D s(box(2));s.parameters().emitterRadius=.15f;
+    double peakSpeed=0,peakEnergy=0;
     for(int i=0;i<600;++i) {
         s.advance(1.f/60);
+        checkSlipTrace(s);
+        auto d=s.diagnostics();
+        peakSpeed=std::max(peakSpeed,d.maxSpeed);
+        peakEnergy=std::max(peakEnergy,d.kineticEnergy);
         if(i%120==119)std::cout<<"time="<<(i+1)/60.<<" energy="<<s.diagnostics().kineticEnergy<<" speed="<<s.diagnostics().maxSpeed<<" boundaryResidual="<<s.lastBoundaryReconstruction().finalResidual<<std::endl;
     }
+    require(std::isfinite(peakEnergy)&&peakEnergy<100&&peakSpeed<50,
+            "Sustained box plume developed excessive energy or wall speed");
     require(s.diagnostics().maxDivergence<1e-8,"Sustained plume divergence");
+    std::cout<<"peak speed="<<peakSpeed<<" peak energy="<<peakEnergy<<'\n';
 }
 void transport() {
     SimplicialFluidSolver3D s(box(2));s.parameters().sourceStrength=0;s.parameters().buoyancy=0;s.parameters().smokeDecay=0;
     s.setDensity([](Point p){return std::exp(-dot(p-Point{1,1,1},p-Point{1,1,1}));});
     auto rho=s.density();s.advance(.1f);require(rho==s.density(),"Stationary smoke changes without decay");
     seed(s);double initial=s.diagnostics().kineticEnergy;
-    for(int i=0;i<30;++i)s.advance(.02f);
+    double peakSpeed=0;
+    for(int i=0;i<600;++i){
+        s.advance(.02f);
+        checkSlipTrace(s);
+        require(s.lastRecovery().converged,"Unforced recovery failed");
+        require(std::isfinite(s.diagnostics().kineticEnergy)&&s.diagnostics().kineticEnergy<initial*2,"Unforced energy diverged during transport");
+        peakSpeed=std::max(peakSpeed,s.diagnostics().maxSpeed);
+    }
     std::cout<<"unforced energy "<<initial<<" -> "<<s.diagnostics().kineticEnergy<<std::endl;
+    require(peakSpeed<20,"Unforced transport developed excessive wall speed");
     require(std::isfinite(s.diagnostics().kineticEnergy)&&s.diagnostics().kineticEnergy<initial*2,"Unforced energy diverged");
     require(s.diagnostics().maxDivergence<1e-10,"Unforced flow broke incompressibility");
+    std::cout<<"peak speed="<<peakSpeed<<'\n';
+}
+void refinement() {
+    auto run=[](float dt) {
+        SimplicialFluidSolver3D s(box(2));seed(s);
+        s.parameters().sourceStrength=0;s.parameters().buoyancy=0;
+        for(int i=0;i<int(std::lround(.4/dt));++i){s.advance(dt);checkSlipTrace(s);}
+        return s.flux();
+    };
+    auto reference=run(.0025f);
+    double previous=1e30;
+    for(float dt:{.02f,.01f,.005f}) {
+        auto flux=run(dt);double squared=0;
+        for(size_t i=0;i<flux.size();++i)squared+=(flux[i]-reference[i])*(flux[i]-reference[i]);
+        double rms=std::sqrt(squared/flux.size());
+        std::cout<<"dt="<<dt<<" flux RMS error="<<rms<<'\n';
+        require(rms<previous,"Box transport does not converge under timestep refinement");previous=rms;
+    }
+}
+void cfl() {
+    SimplicialFluidSolver3D s(box(2));
+    s.parameters().emitterEnabled=false;s.parameters().sourceStrength=0;
+    s.parameters().buoyancy=100;
+    s.setDensity([](Point p){Point d=p-Point{1,1,.5};return std::exp(-8*dot(d,d));});
+    s.advance(.1f);
+    require(s.timings().substeps>1,"Box forcing from rest bypasses CFL subdivision");
+    require(s.diagnostics().kineticEnergy>0,"CFL case did not exercise buoyancy");
+    checkSlipTrace(s);
+    require(s.diagnostics().maxDivergence<1e-9,"Subdivided box lost incompressibility");
+    std::cout<<"box substeps="<<s.timings().substeps<<'\n';
+}
+void emission() {
+    SimplicialFluidSolver3D s(box(2));
+    auto& p=s.parameters();p.buoyancy=0;p.smokeDecay=0;p.emitterRadius=.4f;
+    s.advance(.01f);
+    double inner=0,outer=0;int ni=0,no=0;
+    for(size_t i=0;i<s.vertexDensity().size();++i) {
+        const double r=length(s.domain().vertices[i]-Point{1,1,.4})/.8;
+        const double value=s.vertexDensity()[i];
+        require(value>=0&&value<=1.000001,"Emitter concentration escaped [0,1]");
+        if(r<.3){inner+=value;++ni;}
+        if(r>.9&&r<1){outer+=value;++no;}
+        if(r>1.01)require(value<1e-6,"Emitter injected outside radius");
+    }
+    require(ni>0&&no>0&&inner/ni>outer/no+.1,"Emitter lacks radial falloff");
+    auto previous=s.vertexDensity();p.emitterEnabled=false;s.advance(.01f);
+    for(size_t i=0;i<previous.size();++i)require(std::abs(previous[i]-s.vertexDensity()[i])<1e-6,"Source-off resting smoke changed");
+    s.setDensity([](Point){return 2.;});p.emitterEnabled=true;s.advance(.01f);
+    for(float value:s.vertexDensity())require(std::abs(value-2)<1e-6,"Emitter cap incorrectly clamps existing smoke");
+}
+void denseBox() {
+    SimplicialFluidSolver3D s(Mesh::loadBox("examples/simplicial3d/box-dense.tet",3));
+    require(s.domain().vertices.size()==1331&&s.domain().tets.size()==6177,"Dense box asset mismatch");
+    double wallSpeed=0,ceilingSpeed=0,peakEnergy=0;
+    for(int i=0;i<300;++i) {
+        s.advance(1.f/60);checkSlipTrace(s);
+        auto d=s.diagnostics();
+        require(std::isfinite(d.kineticEnergy)&&d.maxSpeed<50&&d.maxDivergence<1e-8,"Dense plume unstable");
+        peakEnergy=std::max(peakEnergy,d.kineticEnergy);
+        for(size_t v=0;v<s.dual().vertices.size();++v) {
+            if(s.dual().vertices[v].walls)wallSpeed=std::max(wallSpeed,length(s.dualVelocity()[v]));
+            if(s.dual().vertices[v].walls&32)ceilingSpeed=std::max(ceilingSpeed,length(s.dualVelocity()[v]));
+        }
+        if((i+1)%60==0) {
+            double topDensity=0,wallDensity=0;
+            for(size_t v=0;v<s.domain().vertices.size();++v)if(s.domain().boundaryVertices[v])wallDensity=std::max(wallDensity,double(s.vertexDensity()[v]));
+            for(int y=1;y<20;++y)for(int x=1;x<20;++x)topDensity=std::max(topDensity,s.sampleDensity({3.*x/20,3.*y/20,2.85}));
+            std::cout<<"time="<<(i+1)/60.<<" energy="<<d.kineticEnergy<<" speed="<<d.maxSpeed<<" max wall slip="<<wallSpeed<<" max ceiling slip="<<ceilingSpeed<<" wall density="<<wallDensity<<" near-ceiling density="<<topDensity<<std::endl;
+        }
+    }
+    require(s.diagnostics().smokeMass>0&&wallSpeed>1e-3&&ceilingSpeed>1e-3,"Dense plume did not exercise tangential wall flow");
+    std::cout<<"dense plume peak energy="<<peakEnergy<<'\n';
+}
+void coarseSmokeMotion() {
+    SimplicialFluidSolver3D s(Mesh::loadBox("examples/simplicial3d/box-dense.tet", 3));
+    auto& parameters = s.parameters();
+    parameters.smokeDecay = 0;
+    const auto centerOfSmoke = [&] {
+        double mass = 0, height = 0;
+        for (size_t t = 0; t < s.domain().tets.size(); ++t) {
+            const auto& tet = s.domain().tets[t];
+            const double amount = s.density()[t] * tet.volume;
+            mass += amount;
+            for (int v : tet.vertices) height += .25 * amount * s.domain().vertices[v].z;
+        }
+        return std::pair{mass > 0 ? height / mass : 0., mass};
+    };
+    for (int i = 0; i < 30; ++i) s.advance(1.f / 60);
+    const auto [firstHeight, firstMass] = centerOfSmoke();
+    parameters.emitterEnabled = false;
+    for (int i = 0; i < 60; ++i) s.advance(1.f / 60);
+    const auto [lastHeight, lastMass] = centerOfSmoke();
+    std::cout << "coarse 3D tetrahedra=" << s.domain().tets.size()
+              << " smoke center z=" << firstHeight << " -> " << lastHeight
+              << " mass=" << firstMass << " -> " << lastMass
+              << " speed=" << s.diagnostics().maxSpeed << '\n';
+    require(firstMass > 0 && lastMass > 0, "Coarse 3D plume has no smoke");
+    require(lastHeight > firstHeight + .03, "Coarse 3D smoke did not rise");
 }
 }
 int main(int argc,char** argv) {
     try {
         std::string c=argc>1?argv[1]:"";
         if(c=="topology")topology();else if(c=="metric")metric();else if(c=="recovery")recovery();
-        else if(c=="circulation")circulation();else if(c=="forces")forces();
-        else if(c=="simulation")simulation();else if(c=="contracts")contracts();else if(c=="boundaries")boundaries();else if(c=="stability")stability();else if(c=="transport")transport();else throw std::runtime_error("Unknown case");
+        else if(c=="circulation")circulation();else if(c=="forces")forces();else if(c=="emission")emission();
+        else if(c=="simulation")simulation();else if(c=="contracts")contracts();else if(c=="boundaries")boundaries();else if(c=="stability")stability();else if(c=="transport")transport();else if(c=="refinement")refinement();else if(c=="cfl")cfl();else if(c=="dense")denseBox();else if(c=="coarse_motion")coarseSmokeMotion();else throw std::runtime_error("Unknown case");
         std::cout<<"PASS "<<c<<'\n';return 0;
     }catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}
 }

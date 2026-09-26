@@ -11,6 +11,8 @@ uniform double dt, size, decay;
 uniform int dualPosition, nodePosition, tetGeometry, subGradient, wallGeometry;
 uniform int dualHint, primalHint, tetVertices, binOffsets, binItems, wallOffsets, wallItems;
 uniform int subOffsets, subNodes, wallOwners, loopOffsets, loopItems, dualEdges;
+uniform int boxDomain, boxPlanes, cellCorners, cornerVertices, cornerCones, conePlanes;
+uniform int neighborOffsets, neighbors;
 dvec3 geometry3(int index){return dvec3(g[index],g[index+1],g[index+2]);}
 dvec3 input3(int index){return dvec3(inputData[index],inputData[index+1],inputData[index+2]);}
 dvec3 trace3(int index){return dvec3(traced[index],traced[index+1],traced[index+2]);}
@@ -30,6 +32,7 @@ int locate(dvec3 p,int hint){
  return -1;
 }
 dvec3 clipSegment(dvec3 start,dvec3 end,int hint){
+ if(boxDomain!=0)return clamp(end,dvec3(0),dvec3(size));
  if(hint>=0&&smallest(bary(hint,start))>=-1e-10&&smallest(bary(hint,end))>=-1e-10)return end;
  dvec3 delta=end-start;double distance=length(delta);if(distance<1e-14*size)return start;
  double first=1;ivec3 lo=binOf(min(start,end)),hi=binOf(max(start,end));
@@ -46,6 +49,35 @@ dvec3 clipSegment(dvec3 start,dvec3 end,int hint){
  return first<1?start+delta*max(0.,first-1e-8):end;
 }
 dvec3 velocity(dvec3 p,int hint){
+ if(boxDomain!=0) {
+  // A Voronoi cell is the intersection of its Delaunay-neighbor bisectors.
+  // Descent to a site with no closer neighbor therefore finds the nearest site.
+  int site=hint>=0?topo[tetVertices+4*hint]:0;
+  dvec3 delta=p-geometry3(nodePosition+3*site);double nearest=dot(delta,delta);
+  for(int step=0;step<nPrimal;++step) {
+   int next=site;
+   for(int j=topo[neighborOffsets+site];j<topo[neighborOffsets+site+1];++j) {
+    int other=topo[neighbors+j];dvec3 d=p-geometry3(nodePosition+3*other);double squared=dot(d,d);
+    if(squared<nearest||(squared==nearest&&other<next)){nearest=squared;next=other;}
+   }
+   if(next==site)break;site=next;
+  }
+  dvec3 value=dvec3(0);double total=0;
+  for(int j=topo[cellCorners+site];j<topo[cellCorners+site+1];++j) {
+   int v=topo[cornerVertices+j];
+   if(length(geometry3(dualPosition+3*v)-p)<1e-12*size)return input3(3*v);
+   double weight=0;
+   for(int k=topo[cornerCones+j];k<topo[cornerCones+j+1];++k) {
+    int ia=boxPlanes+4*topo[conePlanes+3*k],ib=boxPlanes+4*topo[conePlanes+3*k+1],ic=boxPlanes+4*topo[conePlanes+3*k+2];
+    dvec3 a=geometry3(ia),b=geometry3(ib),c=geometry3(ic);
+    double da=max(1e-13*size,g[ia+3]-dot(a,p)),db=max(1e-13*size,g[ib+3]-dot(b,p)),dc=max(1e-13*size,g[ic+3]-dot(c,p));
+    weight+=abs(dot(a,cross(b,c)))/(da*db*dc);
+   }
+   value+=weight*input3(3*v);total+=weight;
+  }
+  if(isnan(total)||isinf(total)||total<=0){atomicOr(error,2);return dvec3(0);}
+  return value/total;
+ }
  int t=locate(p,hint);if(t<0)return dvec3(0);
  for(int i=topo[subOffsets+t];i<topo[subOffsets+t+1];++i){
   ivec4 ids=ivec4(topo[subNodes+4*i],topo[subNodes+4*i+1],topo[subNodes+4*i+2],topo[subNodes+4*i+3]);
@@ -67,7 +99,8 @@ void main(){
  if(stage==0){
   if(i>=nDual)return;
   dvec3 p=geometry3(dualPosition+3*i);int hint=topo[dualHint+i];
-  dvec3 middle=clipSegment(p,p-input3(3*i)*(dt*.5),hint);
+  dvec3 initial=boxDomain!=0?velocity(p,hint):input3(3*i);
+  dvec3 middle=clipSegment(p,p-initial*(dt*.5),hint);
   dvec3 q=clipSegment(p,p-velocity(middle,hint)*dt,hint),v=velocity(q,hint);
   for(int k=0;k<3;++k){traced[6*i+k]=q[k];traced[6*i+3+k]=v[k];}
  } else if(stage==1){
@@ -78,7 +111,8 @@ void main(){
  } else {
   if(i>=nPrimal)return;
   dvec3 p=geometry3(nodePosition+3*i);int hint=topo[primalHint+i];
-  dvec3 middle=clipSegment(p,p-input3(3*nDual+3*i)*(dt*.5),hint);
+  dvec3 initial=boxDomain!=0?velocity(p,hint):input3(3*nDual+3*i);
+  dvec3 middle=clipSegment(p,p-initial*(dt*.5),hint);
   dvec3 q=clipSegment(p,p-velocity(middle,hint)*dt,hint);
   result[i]=density(q,hint)*decay;
  }

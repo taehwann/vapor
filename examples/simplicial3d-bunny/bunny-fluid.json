@@ -1,0 +1,8 @@
+{
+  "resolution": 18,
+  "vertices": 2317,
+  "tetrahedra": 9921,
+  "source": "bunny.tet",
+  "method": "BCC tetrahedra selected by centroid containment; manifold boundary cleanup; largest connected component",
+  "boundary": "lattice approximation"
+}

@@ -70,6 +70,9 @@ set(VAPOR_SIMPLICIAL_3D_SOURCES
     src/solvers/simplicial3d/SimplicialBoundary3D.hpp src/solvers/simplicial3d/SimplicialBoundary3D.cpp
     src/solvers/simplicial3d/SimplicialFluidSolver3D.hpp src/solvers/simplicial3d/SimplicialFluidSolver3D.cpp)
 configure_file(examples/simplicial3d/box.tet examples/simplicial3d/box.tet COPYONLY)
+configure_file(examples/simplicial3d/box-dense.tet examples/simplicial3d/box-dense.tet COPYONLY)
+configure_file(examples/simplicial3d/box-dense16.tet examples/simplicial3d/box-dense16.tet COPYONLY)
+configure_file(examples/simplicial3d/box-dense32.tet examples/simplicial3d/box-dense32.tet COPYONLY)
 configure_file(examples/simplicial3d-bunny/bunny.tet examples/simplicial3d-bunny/bunny.tet COPYONLY)
 configure_file(examples/simplicial3d-bunny/bunny-fluid.tet examples/simplicial3d-bunny/bunny-fluid.tet COPYONLY)
 set(VAPOR_2D_PRESENTATION_SOURCES
@@ -84,6 +87,9 @@ if(VAPOR_BUILD_APP)
     set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
     set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    # Export the Optimus/PowerXpress preference from our statically linked GLFW.
+    # On hybrid NVIDIA laptops this requests the discrete GPU at process startup.
+    set(GLFW_USE_HYBRID_HPG ON CACHE BOOL "Prefer the high-performance GPU" FORCE)
     add_subdirectory(dependency/glfw)
 
     set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dependency/imgui)
@@ -156,6 +162,7 @@ if(VAPOR_BUILD_APP)
         src/app/SimulationAppSimplicial3D.cpp
         src/app/SimulationAppMesh3D.cpp
         src/renderer/SimplicialRenderData3D.hpp
+        src/solvers/simplicial3d/gpu/GpuSimplicial3D.cpp
         ${VAPOR_SIMPLICIAL_3D_SOURCES}
 
         ${VAPOR_APP_SUPPORT_SOURCES}
@@ -174,7 +181,13 @@ if(VAPOR_BUILD_APP)
     add_custom_command(TARGET vapor POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:vapor>/examples/simplicial3d"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/examples/simplicial3d/box.tet" "$<TARGET_FILE_DIR:vapor>/examples/simplicial3d/box.tet")
+            "${CMAKE_CURRENT_SOURCE_DIR}/examples/simplicial3d/box.tet" "$<TARGET_FILE_DIR:vapor>/examples/simplicial3d/box.tet"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/examples/simplicial3d/box-dense.tet" "$<TARGET_FILE_DIR:vapor>/examples/simplicial3d/box-dense.tet"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/examples/simplicial3d/box-dense16.tet" "$<TARGET_FILE_DIR:vapor>/examples/simplicial3d/box-dense16.tet"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/examples/simplicial3d/box-dense32.tet" "$<TARGET_FILE_DIR:vapor>/examples/simplicial3d/box-dense32.tet")
     set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT vapor)
     add_custom_command(TARGET vapor POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -220,10 +233,11 @@ if(BUILD_TESTING)
     set_tests_properties(simplicial3d_bunny PROPERTIES TIMEOUT 600)
     add_executable(vapor_simplicial_3d_performance tests/Simplicial3DPerformance.cpp ${VAPOR_SIMPLICIAL_3D_SOURCES})
     target_include_directories(vapor_simplicial_3d_performance PRIVATE src)
-    foreach(case IN ITEMS topology metric recovery circulation forces boundaries simulation contracts stability transport)
+    foreach(case IN ITEMS topology metric recovery circulation forces emission boundaries simulation contracts stability transport refinement cfl dense coarse_motion)
         add_test(NAME simplicial3d_${case} COMMAND vapor_simplicial_3d_tests ${case})
     endforeach()
     set_tests_properties(simplicial3d_stability PROPERTIES TIMEOUT 120)
+    set_tests_properties(simplicial3d_dense PROPERTIES TIMEOUT 300)
     add_executable(vapor_historical_2d_tests tests/Historical2DTests.cpp
         tests/fixtures/Ba20987Smoke2D.hpp src/solvers/mac2d/ReflectionMacFluidSolver2D.hpp)
     add_test(NAME mac2d_historical_parity COMMAND vapor_historical_2d_tests)
@@ -275,7 +289,7 @@ if(BUILD_TESTING)
         ${VAPOR_SIMPLICIAL_2D_SOURCES} ${VAPOR_SIMPLICIAL_2D_PRESENTATION_SOURCES})
     foreach(case IN ITEMS simplicial2d_mesh simplicial2d_velocity simplicial2d_recovery
                           simplicial2d_circulation simplicial2d_simulation simplicial2d_cfl
-                          simplicial2d_stability simplicial2d_presentation simplicial2d_walls simplicial2d_refinement)
+                          simplicial2d_stability simplicial2d_presentation simplicial2d_walls simplicial2d_refinement simplicial2d_coarse_motion)
         add_test(NAME ${case} COMMAND vapor_simplicial_2d_tests ${case})
     endforeach()
 
@@ -344,6 +358,12 @@ if(BUILD_TESTING AND VAPOR_BUILD_APP)
     target_include_directories(vapor_simplicial_gpu_tests PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(vapor_simplicial_gpu_tests PRIVATE glfw OpenGL::GL Threads::Threads)
     add_test(NAME simplicial3d_gpu COMMAND vapor_simplicial_gpu_tests)
+    add_test(NAME simplicial3d_gpu_box COMMAND vapor_simplicial_gpu_tests 20 examples/simplicial3d/box.tet)
+    add_test(NAME simplicial3d_gpu_box16 COMMAND vapor_simplicial_gpu_tests 20 examples/simplicial3d/box-dense16.tet)
+    add_test(NAME simplicial3d_gpu_box32 COMMAND vapor_simplicial_gpu_tests 5 examples/simplicial3d/box-dense32.tet)
+    add_test(NAME simplicial3d_gpu_coarse_motion COMMAND vapor_simplicial_gpu_tests motion examples/simplicial3d/box-dense.tet 90)
+    set_tests_properties(simplicial3d_gpu_box32 PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} SKIP_RETURN_CODE 77 TIMEOUT 600)
+    set_tests_properties(simplicial3d_gpu_box simplicial3d_gpu_box16 simplicial3d_gpu_coarse_motion PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} SKIP_RETURN_CODE 77 TIMEOUT 600)
     set_tests_properties(simplicial3d_gpu PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 foreach(vapor_threaded_target IN ITEMS vapor vapor_startup_tests vapor_construction_tests

@@ -52,17 +52,37 @@ GpuSimplicial3D::~GpuSimplicial3D()=default;
 const std::string& GpuSimplicial3D::device() const{return impl_->renderer;}
 void GpuSimplicial3D::initialize(const SimplicialFluidSolver3D& solver){
  auto& gpu=*impl_;const auto& mesh=solver.mesh_;const auto& dual=solver.dual_;
- if(mesh.boxDomain)throw std::invalid_argument("GPU simplicial backend requires the domain subdivision (select Bunny)");
  if(gpu.meshKey==mesh.tets.data()&&gpu.size==mesh.size)return;
  gpu.bindAdvection();std::vector<double> geometry;std::vector<int> topology;
  auto gd=[&](const char* name,const std::vector<double>& data){setInt(gpu.advect,name,int(geometry.size()));geometry.insert(geometry.end(),data.begin(),data.end());};
  auto gi=[&](const char* name,const std::vector<int>& data){setInt(gpu.advect,name,int(topology.size()));topology.insert(topology.end(),data.begin(),data.end());};
  auto point=[](std::vector<double>& data,Point p){data.insert(data.end(),{p.x,p.y,p.z});};
  std::vector<double> data;for(const auto& v:dual.vertices)point(data,v.position);gd("dualPosition",data);
- data.clear();for(const auto& node:dual.nodes_)point(data,node.position);gd("nodePosition",data);
+ data.clear();if(mesh.boxDomain){for(auto p:mesh.vertices)point(data,p);}else{for(const auto& node:dual.nodes_)point(data,node.position);}gd("nodePosition",data);
  data.clear();std::vector<int> ids;
  for(const auto& tet:mesh.tets){point(data,mesh.vertices[tet.vertices[0]]);for(int k=1;k<4;++k)point(data,tet.gradients[k]);ids.insert(ids.end(),tet.vertices.begin(),tet.vertices.end());}
- gd("tetGeometry",data);gi("tetVertices",ids);gi("dualHint",solver.dualTets_);gi("primalHint",solver.primalTets_);
+ gd("tetGeometry",data);gi("tetVertices",ids);
+ if(mesh.boxDomain) {
+  std::vector<int> hints;for(auto v:dual.vertices)hints.push_back(mesh.locate(v.position,v.tet));gi("dualHint",hints);
+  hints.assign(mesh.vertices.size(),-1);for(int t=0;t<int(mesh.tets.size());++t)for(int v:mesh.tets[t].vertices)hints[v]=t;gi("primalHint",hints);
+  std::vector<int> cellCorners{0},cornerVertices,cornerCones{0},conePlanes,neighborOffsets{0},neighbors;
+  data.clear();int planeBase=0;
+  for(const auto& cell:dual.cells) {
+   const int site=int(neighborOffsets.size())-1;
+   for(auto plane:cell.planes)if(plane.primalEdge>=0){auto edge=mesh.edges[plane.primalEdge].vertices;neighbors.push_back(edge[0]==site?edge[1]:edge[0]);}
+   neighborOffsets.push_back(int(neighbors.size()));
+   for(auto plane:cell.planes){point(data,plane.normal);data.push_back(plane.offset);}
+   for(const auto& corner:cell.corners) {
+    cornerVertices.push_back(corner.vertex);
+    for(auto cone:corner.cones)for(int p:cone)conePlanes.push_back(planeBase+p);
+    cornerCones.push_back(int(conePlanes.size()/3));
+   }
+   cellCorners.push_back(int(cornerVertices.size()));planeBase+=int(cell.planes.size());
+  }
+  gd("boxPlanes",data);gi("cellCorners",cellCorners);gi("cornerVertices",cornerVertices);gi("cornerCones",cornerCones);gi("conePlanes",conePlanes);
+  gi("neighborOffsets",neighborOffsets);gi("neighbors",neighbors);
+ } else {gi("dualHint",solver.dualTets_);gi("primalHint",solver.primalTets_);}
+ setInt(gpu.advect,"boxDomain",mesh.boxDomain?1:0);
  auto bins=[&](const auto& cells,const char* offsets,const char* items){std::vector<int> ptr{0},flat;for(const auto& cell:cells){flat.insert(flat.end(),cell.begin(),cell.end());ptr.push_back(int(flat.size()));}gi(offsets,ptr);gi(items,flat);};
  bins(mesh.bins_,"binOffsets","binItems");bins(mesh.boundaryBins_,"wallOffsets","wallItems");
  data.clear();ids.clear();for(const auto& f:mesh.faces){point(data,f.areaNormal*(f.tets[0]>=0?1.:-1.));point(data,mesh.vertices[f.vertices[0]]);ids.push_back(f.tets[0]>=0?f.tets[0]:f.tets[1]);}gd("wallGeometry",data);gi("wallOwners",ids);
@@ -98,7 +118,7 @@ void GpuSimplicial3D::advectCirculation(const SimplicialFluidSolver3D& solver,do
 }
 void GpuSimplicial3D::advectDensity(const SimplicialFluidSolver3D& solver,double dt,std::vector<float>& density){
  initialize(solver);auto& gpu=*impl_;gpu.bindAdvection();gpu.uploadState(solver);setDouble(gpu.advect,"dt",dt);setDouble(gpu.advect,"decay",std::exp(-solver.parameters_.smokeDecay*dt));
- gpu.dispatchAdvection(2,gpu.nv);std::vector<double> values(gpu.nv);read(gpu.buffers[Impl::Output],0,values.size()*sizeof(double),values.data());density.assign(values.begin(),values.end());gpu.check();
+ gpu.dispatchAdvection(2,gpu.nv);std::vector<double> values(gpu.nv);read(gpu.buffers[Impl::Output],0,values.size()*sizeof(double),values.data());density.resize(values.size());std::transform(values.begin(),values.end(),density.begin(),[](double value){return float(value);});gpu.check();
 }
 LinearSolveResult GpuSimplicial3D::recover(const SimplicialFluidSolver3D& solver,std::span<const double> rhs,std::vector<double>& x){
  initialize(solver);auto& gpu=*impl_;gpu.bindRecovery();

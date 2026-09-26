@@ -23,7 +23,9 @@ constexpr SolverItem solvers[] = {{"Mac2DSimple-SemiLagrangian", SolverChoice::M
                                   {"Mac3DReflection-SemiLagrangian-GPU", SolverChoice::Mac3DReflectionSLGPU},
                                   {"Mac3DReflection-MacCormack-CPU", SolverChoice::Mac3DReflectionMCCPU},
                                   {"Mac3DReflection-MacCormack-GPU", SolverChoice::Mac3DReflectionMCGPU},
+                                  {"Simplicial2D-Box", SolverChoice::Simplicial2DBox},
                                   {"Simplicial2D-Teapot", SolverChoice::Simplicial2DTeapot},
+                                  {"Simplicial3D-Box", SolverChoice::Simplicial3DBox},
                                   {"Simplicial3D-Bunny", SolverChoice::BunnyMesh}};
 
 std::optional<SolverChoice> selectSolver(int& selected) {
@@ -53,7 +55,11 @@ std::optional<SolverChoice> selectSolver(int& selected) {
             ImGui::EndCombo();
         }
         ImGui::Spacing();
-        if (solvers[selected].choice == SolverChoice::BunnyMesh)
+        if (solvers[selected].choice == SolverChoice::Simplicial3DBox)
+            ImGui::TextWrapped("Inviscid smoke in a cube filled with quality-checked tetrahedra; inspect primal and dual edges with a cutaway.");
+        else if (solvers[selected].choice == SolverChoice::Simplicial2DBox)
+            ImGui::TextWrapped("Inviscid smoke in a square filled with non-obtuse triangles; inspect the triangular mesh.");
+        else if (solvers[selected].choice == SolverChoice::BunnyMesh)
             ImGui::TextWrapped("Inviscid smoke inside a tetrahedral bunny domain, with primal and dual wireframe controls.");
         else if (solvers[selected].choice == SolverChoice::Simplicial2DTeapot)
             ImGui::TextWrapped("Inviscid smoke in a triangular teapot domain, with solid outer and handle walls.");
@@ -96,13 +102,15 @@ int SimulationApp::runSolver(SolverChoice choice, const RunOptions& options) {
     case SolverChoice::Mac2DReflectionSL:
     case SolverChoice::Mac2DReflectionMC:
         return run2D(choice, options);
+    case SolverChoice::Simplicial2DBox:
     case SolverChoice::Simplicial2DTeapot: {
         auto timing = options;
         timing.fixedDt = 1.f / 30.f;
         return run2D(choice, timing);
     }
+    case SolverChoice::Simplicial3DBox:
     case SolverChoice::BunnyMesh:
-        return runSimplicial3D(options);
+        return runSimplicial3D(choice, options);
     case SolverChoice::Mac3DSimpleSLCPU:
         return run3D(MacAlgorithm::SimpleSemiLagrangian, false, options);
     case SolverChoice::Mac3DSimpleSLGPU:

@@ -4,6 +4,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace simplicial3d {
 namespace {
@@ -16,8 +17,27 @@ std::pair<Point,Point> tangentBasis(Point n) {
 DualMesh::DualMesh(const Mesh& mesh):size_(mesh.size) {
     if(!mesh.boxDomain){buildDomain(mesh);return;}
     const double tolerance=1e-8*size_;
+    struct VertexBinHash {
+        size_t operator()(const std::array<long long,3>& key) const noexcept {
+            size_t hash=0;
+            for(auto value:key)hash^=std::hash<long long>{}(value)+size_t(0x9e3779b9)+(hash<<6)+(hash>>2);
+            return hash;
+        }
+    };
+    std::unordered_map<std::array<long long,3>,std::vector<int>,VertexBinHash> vertexBins;
+    vertexBins.reserve(mesh.tets.size()*2);
     auto vertexId=[&](Point p,int tet=-1) {
-        for(int i=0;i<int(vertices.size());++i) if(length(vertices[i].position-p)<tolerance) {
+        const std::array<long long,3> key{static_cast<long long>(std::floor(p.x/tolerance)),static_cast<long long>(std::floor(p.y/tolerance)),static_cast<long long>(std::floor(p.z/tolerance))};
+        int first=-1;
+        // Check neighboring bins and retain the first inserted matching vertex,
+        // exactly as the former linear search did. No geometry is quantized.
+        for(int x=-1;x<=1;++x)for(int y=-1;y<=1;++y)for(int z=-1;z<=1;++z) {
+            auto it=vertexBins.find({key[0]+x,key[1]+y,key[2]+z});
+            if(it!=vertexBins.end())for(int i:it->second)
+                if((first<0||i<first)&&length(vertices[i].position-p)<tolerance)first=i;
+        }
+        if(first>=0) {
+            const int i=first;
             if(tet>=0 && vertices[i].tet>=0 && vertices[i].tet!=tet)
                 throw std::invalid_argument("Coincident circumcenters: regenerate a nondegenerate Delaunay mesh");
             if(tet>=0)vertices[i].tet=tet;return i;
@@ -26,7 +46,8 @@ DualMesh::DualMesh(const Mesh& mesh):size_(mesh.size) {
         if(std::abs(p.x)<tolerance)walls|=1;if(std::abs(p.x-size_)<tolerance)walls|=2;
         if(std::abs(p.y)<tolerance)walls|=4;if(std::abs(p.y-size_)<tolerance)walls|=8;
         if(std::abs(p.z)<tolerance)walls|=16;if(std::abs(p.z-size_)<tolerance)walls|=32;
-        vertices.push_back({p,tet,walls});return int(vertices.size())-1;
+        vertices.push_back({p,tet,walls});
+        const int id=int(vertices.size())-1;vertexBins[key].push_back(id);return id;
     };
     for(int t=0;t<int(mesh.tets.size());++t) vertexId(mesh.tets[t].center,t);
     cells.resize(mesh.vertices.size());loops.resize(mesh.edges.size());

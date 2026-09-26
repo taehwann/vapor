@@ -22,6 +22,11 @@ Close the simulation window to return to the picker. Settings are controlled in
 the application; no configuration file is needed. CMake copies required meshes
 beside the executable.
 
+Windows builds request the high-performance GPU through GLFW's
+Optimus/PowerXpress exports, preferring the NVIDIA GPU on hybrid NVIDIA laptops.
+Restart the executable after rebuilding. The 3D box controls display the actual
+compute device. An explicit Windows graphics preference can override this request.
+
 ## Solvers
 
 | Solver | Domain | Execution |
@@ -30,11 +35,18 @@ beside the executable.
 | MAC 2D Reflection | Regular grid | CPU, semi-Lagrangian or MacCormack smoke transport |
 | MAC 3D Simple / Reflection | Regular grid | CPU or GPU, semi-Lagrangian or MacCormack |
 | Simplicial2D-Teapot | Triangular teapot silhouette | CPU |
+| Simplicial2D-Box | Square filled with triangles | CPU |
+| Simplicial3D-Box | Cube filled with tetrahedra | GPU advection/recovery + CPU support |
 | Simplicial3D-Bunny | Tetrahedral bunny volume | CPU |
 
 Simplicial solvers transport circulation and recover incompressible flow.
 They have no viscosity. The bunny uses 9,921 tetrahedra approximating the imported
-bunny shape. The experimental simplicial GPU backend is not enabled in the picker.
+bunny shape. The 3D box scene uses OpenGL compute for circulation
+advection, smoke advection and the potential solve. Boundary reconstruction,
+forces, mesh setup and volume resampling remain on the CPU; the controls show
+the active GPU device. This is a hybrid solver, not a fully GPU-resident pipeline.
+The experimental bunny GPU backend remains outside the picker because its
+sustained CPU/GPU comparison currently fails.
 
 ## Controls
 
@@ -61,8 +73,29 @@ but scalar transport is not mass-conservative and does not guarantee uniform fil
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The older simplicial box stability and transport tests have known failures.
-The square and box remain test fixtures, not picker scenes.
+The simplicial 3D box uses a flux-derived slip-wall closure without a circulation
+limiter or physical viscosity. Tangential wall velocities are projected from the
+recovered interior field; boundary circulation is derived from that trace rather
+than evolved as an independent constraint. This changes the boundary discretization:
+it does not reproduce the paper's independently transported wall circulation.
+Box timesteps use CFL subdivision including existing smoke and incoming buoyancy.
+The plume, sustained unforced transport, and timestep-refinement regressions check
+the resulting scheme; they do not establish unconditional stability.
+The box scenes use a square mesh with 32 subdivisions per side (2,048 triangles)
+and a side-length-3 tetrahedral cube generated at 10 subdivisions per axis
+(1,331 vertices, 6,177 tetrahedra, `examples/simplicial3d/box-dense.tet`).
+The finer 16- and 32-subdivision tetrahedral assets remain available for tests.
+The 3D box emitter uses the same capped radial profile as 2D:
+`min(1, 3 * sourceStrength * exp(-3.5 * (distance / radius)^2))` inside the
+source sphere. The cap controls injected concentration; existing density is
+preserved when the source shrinks or turns off.
+The older 343-vertex cube is retained as
+a numerical regression fixture. The 3D box opens with
+smoke and the full domain outline. Mesh inspection and its optional X cutaway
+remain available in the visualization controls. The 2D simplicial scene starts
+with smoke decay disabled; linear scalar interpolation still introduces blur.
+The tetrahedral asset is validated for full box volume, boundary faces, and
+in-box circumcenters when loaded.
 
 For numerical tests without the graphical application:
 

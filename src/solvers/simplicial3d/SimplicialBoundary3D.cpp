@@ -9,7 +9,8 @@ namespace simplicial3d {
 Point BoundaryCirculation::tangent(Point p,unsigned walls) {
     if(walls&3)p.x=0;if(walls&12)p.y=0;if(walls&48)p.z=0;return p;
 }
-BoundaryCirculation::BoundaryCirculation(const Mesh& mesh,const DualMesh& dual) {
+BoundaryCirculation::BoundaryCirculation(const Mesh& mesh,const DualMesh& dual)
+    : wallRowL1_(mesh.edges.size(),0) {
     for(int e=0;e<int(mesh.edges.size());++e)if(mesh.edges[e].boundary) {
         std::map<int,Point> coefficients;
         for(auto side:dual.loops[e]) {
@@ -18,7 +19,10 @@ BoundaryCirculation::BoundaryCirculation(const Mesh& mesh,const DualMesh& dual) 
             for(int v:{edge.a,edge.b})coefficients[v]=coefficients[v]+(mesh.boxDomain ? tangent(delta,dual.vertices[v].walls) : tangentToNormals(delta,dual.vertices[v].normals));
         }
         Row row;row.primalEdge=e;
-        for(auto [v,c]:coefficients) {row.coefficients.push_back({v,c});row.diagonal+=dot(c,c);}
+        for(auto [v,c]:coefficients) {
+            row.coefficients.push_back({v,c});row.diagonal+=dot(c,c);
+            wallRowL1_[e]+=std::abs(c.x)+std::abs(c.y)+std::abs(c.z);
+        }
         if(row.diagonal<=0)throw std::invalid_argument("Boundary dual face has no tangential circulation degrees of freedom");
         rows_.push_back(std::move(row));
     }

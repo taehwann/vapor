@@ -14,7 +14,9 @@ enum class SolverChoice {
     Mac3DReflectionSLGPU,
     Mac3DReflectionMCCPU,
     Mac3DReflectionMCGPU,
+    Simplicial2DBox,
     Simplicial2DTeapot,
+    Simplicial3DBox,
     BunnyMesh
 };
 
@@ -34,6 +36,6 @@ class SimulationApp {
   private:
     int run2D(SolverChoice choice, const RunOptions& options);
     int run3D(MacAlgorithm algorithm, bool useGpu, const RunOptions& options);
-    int runSimplicial3D(const RunOptions& options);
+    int runSimplicial3D(SolverChoice choice, const RunOptions& options);
     int runMesh3D(const RunOptions& options);
 };

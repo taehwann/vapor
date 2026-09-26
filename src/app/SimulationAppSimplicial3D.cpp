@@ -8,6 +8,7 @@
 #include "renderer/SilhouetteRenderer.hpp"
 #include "renderer/VolumeRenderer.hpp"
 #include "solvers/simplicial3d/SimplicialFluidSolver3D.hpp"
+#include "solvers/simplicial3d/gpu/GpuSimplicial3D.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -16,12 +17,20 @@
 #include <imgui_impl_opengl3.h>
 #include <limits>
 
-int SimulationApp::runSimplicial3D(const RunOptions &options) {
+int SimulationApp::runSimplicial3D(SolverChoice choice, const RunOptions &options) {
   WindowContext context(960, 960, "vapor - 3D simplicial fluids",
                         options.hidden);
   auto *window = context.window();
-  SimplicialFluidSolver3D solver(simplicial3d::Mesh::loadDomain(
-      options.assetDirectory / "examples/simplicial3d-bunny/bunny-fluid.tet", 2));
+  const bool boxDomain = choice == SolverChoice::Simplicial3DBox;
+  SimplicialFluidSolver3D solver(boxDomain
+      ? simplicial3d::Mesh::loadBox(options.assetDirectory / "examples/simplicial3d/box-dense.tet", 3)
+      : simplicial3d::Mesh::loadDomain(options.assetDirectory / "examples/simplicial3d-bunny/bunny-fluid.tet", 2));
+  std::unique_ptr<GpuSimplicial3D> compute;
+  if (boxDomain) {
+    compute = std::make_unique<GpuSimplicial3D>();
+    compute->initialize(solver);
+    solver.setComputeBackend(compute.get());
+  }
   SimplicialRenderData3D raster(64);
   raster.update(solver);
   VolumeRenderer renderer;
@@ -34,8 +43,8 @@ int SimulationApp::runSimplicial3D(const RunOptions &options) {
   };
   updateWires();
   int visualization = 0;
-  bool showPrimal = true, showDual = true, wireDepth = true, saveRender = false;
-  float cutaway = 1;
+  bool showPrimal = true, showDual = !boxDomain, wireDepth = !boxDomain, saveRender = false;
+  float cutaway = 1.f;
   bool showBoundary = true;
   float simulationSpeed = 1, renderStep = .5f;
   double simulationTime = 0;
@@ -110,12 +119,17 @@ int SimulationApp::runSimplicial3D(const RunOptions &options) {
       simulationTime = 0;
       raster.update(solver);
     }
-    ImGui::Text("%s | %zu tetrahedra", "Bunny",
-                solver.domain().tets.size());
+    ImGui::Text("%s | %zu vertices | %zu tetrahedra", boxDomain ? "Box" : "Bunny",
+                solver.domain().vertices.size(), solver.domain().tets.size());
+    if (compute) ImGui::Text("GPU compute: %s", compute->device().c_str());
+    else ImGui::TextUnformatted("CPU compute");
+    if (boxDomain) {
+      ImGui::TextWrapped("Slip walls: tangential flow is derived from the interior. Wall circulation is approximate.");
+    }
 
     ImGui::Combo("Visualization", &visualization,
                  "Smoke + outline\0Mesh inspection\0Smoke + mesh inspection\0");
-    ImGui::Checkbox("Bunny silhouette outline", &showBoundary);
+    ImGui::Checkbox("Domain outline", &showBoundary);
     if (visualization != 0) {
       ImGui::Checkbox("Primal (white)", &showPrimal);
       ImGui::Checkbox("Dual (green)", &showDual);
@@ -152,7 +166,7 @@ int SimulationApp::runSimplicial3D(const RunOptions &options) {
       const auto &timing = solver.timings();
       double stepMs = timing.emissionMs + timing.advectionMs + timing.forcesMs +
                       timing.recoveryMs + timing.smokeMs;
-      ImGui::Text("CPU step: %.1f ms | volume update: %.2f ms", stepMs,
+      ImGui::Text("Step (CPU + GPU): %.1f ms | volume update: %.2f ms", stepMs,
                   volumeUpdateMs);
       ImGui::Text("Substeps: %d", timing.substeps);
       ImGui::SliderFloat("Advection CFL", &p.advectionCfl, .1f, .8f);
@@ -176,7 +190,7 @@ int SimulationApp::runSimplicial3D(const RunOptions &options) {
     ImGui::Text("Emitter: %s | source vertices: %d", p.emitterEnabled && p.sourceStrength > 0 ? "on" : "off",
                 solver.timings().sourceVertices);
     if (p.emitterEnabled && p.sourceStrength > 0 && solver.timings().sourceVertices == 0 && !paused)
-      ImGui::TextWrapped("Emitter misses mesh vertices: move it into the bunny or increase its radius.");
+      ImGui::TextWrapped("Emitter misses mesh vertices: move it into the domain or increase its radius.");
     ImGui::Text("Boundary circulation residual: %.2e",
                 solver.lastBoundaryReconstruction().finalResidual);
     ImGui::TextUnformatted("Drag to orbit; scroll to zoom");

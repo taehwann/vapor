@@ -30,7 +30,7 @@ void rejects(Function&& function) {
 }
 
 void meshTopology() {
-    for (int n : {2, 5, 12}) {
+    for (int n : {2, 5, 12, 64}) {
         SimplicialMesh2D mesh(n, 3.f);
         require(mesh.dimension() == Dimension::D2, "Simplicial dimension tag");
         require(mesh.vertexCount() == std::size_t((n + 1) * (n + 1)), "Vertex count");
@@ -406,6 +406,32 @@ void stability(int frames, const char* snapshotPrefix) {
         }
     }
 }
+void coarseSmokeMotion() {
+    SimplicialFluidSolver2D solver(32, 4.f);
+    auto& parameters = solver.parameters();
+    parameters.smokeDecay = 0;
+    const auto centerOfSmoke = [&] {
+        double mass = 0, height = 0;
+        const auto& mesh = solver.domain();
+        for (size_t i = 0; i < mesh.vertexCount(); ++i) {
+            const double value = solver.state().density()[i];
+            mass += value;
+            height += value * mesh.vertices()[i].position.y;
+        }
+        return std::pair{mass > 0 ? height / mass : 0., mass};
+    };
+    for (int i = 0; i < 30; ++i) solver.advance(1.f / 60);
+    const auto [firstHeight, firstMass] = centerOfSmoke();
+    parameters.sourceStrength = 0;
+    for (int i = 0; i < 60; ++i) solver.advance(1.f / 60);
+    const auto [lastHeight, lastMass] = centerOfSmoke();
+    std::cout << "coarse 2D triangles=" << solver.domain().triangleCount()
+              << " smoke center y=" << firstHeight << " -> " << lastHeight
+              << " mass=" << firstMass << " -> " << lastMass
+              << " speed=" << solver.diagnostics().maxVelocity << '\n';
+    require(firstMass > 0 && lastMass > 0, "Coarse 2D plume has no smoke");
+    require(lastHeight > firstHeight + .03, "Coarse 2D smoke did not rise");
+}
 }
 
 int main(int argc, char** argv) {
@@ -422,6 +448,7 @@ int main(int argc, char** argv) {
         else if (name == "simplicial2d_refinement") temporalRefinement();
         else if (name == "simplicial2d_stability")
             stability(argc > 2 ? std::stoi(argv[2]) : 30, argc > 3 ? argv[3] : nullptr);
+        else if (name == "simplicial2d_coarse_motion") coarseSmokeMotion();
         else throw std::invalid_argument("Unknown 2D simplicial test case");
         std::cout << "PASS " << name << '\n';
     } catch (const std::exception& error) {
